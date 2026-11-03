@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.log
+*.adi
+*.adi.bak
+ic7300_macros.json
+*.pem
+*.key
+*.pfx
+*.p12
+.vscode/
+.idea/
