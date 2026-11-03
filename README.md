@@ -1,6 +1,8 @@
 # IC-7300 Web Remote
 
 **Browser-based remote control, live spectrum/waterfall, CW console, and ADIF QSO logging for the Icom IC-7300.**
+### Main Web Interface
+![IC-7300 Web Control](images/main.png)
 
 Developed by **9A3ZI**. The application is a single Python server with an embedded web interface. It communicates with the transceiver through the USB CI-V serial connection and uses WebSockets to update the browser.
 
