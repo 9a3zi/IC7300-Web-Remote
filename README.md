@@ -146,4 +146,4 @@ Issues, reproducible bug reports and pull requests are welcome. Please include t
 
 ## License
 
-**No license has been selected yet.** Add a `LICENSE` file before inviting reuse or redistribution under an open-source license (for example, MIT if that is your choice). Until then, the repository does not grant general reuse rights merely by being public.
+**MIT
