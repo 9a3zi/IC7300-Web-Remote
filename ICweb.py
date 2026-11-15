@@ -905,7 +905,7 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
 h4{margin:0 0 4px;color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase}
 canvas{display:block;background:#0b0f14}
 </style></head><body>
-<header><b>IC-7300 web remote server by 9a3zi - ICweb v2.01</b><span><span id="splitb" style="color:#e5484d;font-weight:700;display:none">SPLIT · </span><span id="st">○ connecting…</span></span></header>
+<header><b>IC-7300 web remote server by 9a3zi - ICweb v2.1</b><span><span id="splitb" style="color:#e5484d;font-weight:700;display:none">SPLIT · </span><span id="st">○ connecting…</span></span></header>
 
 <div class="card"><div id="freq"></div>
 <div id="txf" style="text-align:center;color:#e5484d;font:700 15px ui-monospace,monospace;display:none;margin-top:-2px;cursor:pointer" title="Klik = ponovno ocitaj TX frekvenciju"></div>
@@ -919,7 +919,7 @@ canvas{display:block;background:#0b0f14}
 <div class="row" id="spans" style="align-items:center"></div>
 <div class="row" style="align-items:center;color:var(--mut)">Down <input type="range" id="flo" min="0" max="120" value="20" style="width:90px"> Up <input type="range" id="fhi" min="40" max="160" value="120" style="width:90px"></div></div>
 
-<div class="card" style="padding:6px 8px"><div class="row" style="align-items:center;margin:0"><button id="aud">🔇 Audio</button>
+<div class="card" style="padding:6px 8px"><div class="row" style="align-items:center;margin:0"><button id="aud">🔇 Audio</button><button id="micbtn" type="button">🎤 MIC OFF</button>
 <span style="font-size:12px">Volume</span><input type="range" id="vol" min="0" max="200" value="100" style="width:110px"><span id="mic" style="color:var(--mut);font-size:11px"></span></div></div>
 
 <div class="grid">
@@ -1060,9 +1060,19 @@ fetch('/api/macros').then(r=>r.json()).then(d=>{
 
 // PTT: drži za TX (i touch)
 const ptt=$('ptt');
-['pointerdown'].forEach(n=>ptt.addEventListener(n,e=>{ptt.setPointerCapture(e.pointerId);tx('ptt',1)}));
-['pointerup','pointercancel'].forEach(n=>ptt.addEventListener(n,()=>tx('ptt',0)));
-addEventListener('blur',()=>S.ptt&&tx('ptt',0));
+let pttHeld=false;
+ptt.addEventListener('pointerdown',e=>{
+  if(!micReady || !['USB','LSB'].includes(S.mode)){
+    $('mic').textContent='SSB TX: uključi MIC i odaberi USB/LSB';return;
+  }
+  if(!ws || ws.readyState!==1)return;
+  pttHeld=true;ptt.setPointerCapture(e.pointerId);tx('ptt',1);
+});
+function releasePTT(){if(pttHeld){pttHeld=false;tx('ptt',0)}}
+ptt.addEventListener('pointerup',releasePTT);
+ptt.addEventListener('pointercancel',releasePTT);
+addEventListener('blur',releasePTT);
+addEventListener('pagehide',releasePTT);
 
 $('txf').onclick=()=>tx('txfreq',1);
 function fmtT(hz){return Math.floor(hz/1e6)+'.'+String(Math.floor(hz%1e6/1e3)).padStart(3,'0')+'.'+String(Math.floor(hz%1e3/10)).padStart(2,'0')}
@@ -1086,7 +1096,7 @@ function conn(){
   ws=new WebSocket((location.protocol=='https:'?'wss':'ws')+'://'+location.host+'/ws');
   ws.onopen=()=>{ws.binaryType='arraybuffer';$('st').textContent='● connected';
     tx('cwmode',CWKEY?'key':'buf')};
-  ws.onclose=()=>{$('st').textContent='○ disconnected';setTimeout(conn,1500)};
+  ws.onclose=()=>{pttHeld=false;$('st').textContent='○ disconnected';setTimeout(conn,1500)};
   ws.onmessage=e=>{if(typeof e.data!=='string')return onBin(e.data);Object.assign(S,JSON.parse(e.data));render()};
 }
 
@@ -1124,21 +1134,45 @@ function playRx(d){
   const s=ac.createBufferSource();s.buffer=b;s.connect(gain);
   const t=ac.currentTime;if(nextT<t+0.03)nextT=t+0.15;s.start(nextT);nextT+=b.duration}
 $('vol').oninput=()=>gain&&(gain.gain.value=$('vol').value/100);
-$('aud').onclick=async()=>{
+let micReady=false,micStream=null,micProcessor=null;
+async function startAudio(){
   if(ac)return;
-  ac=new AudioContext();gain=ac.createGain();gain.gain.value=$('vol').value/100;gain.connect(ac.destination);
+  ac=new AudioContext();gain=ac.createGain();gain.gain.value=$('vol').value/100;
+  gain.connect(ac.destination);
   $('aud').className='on';$('aud').textContent='🔊 Audio ON';
+}
+$('aud').onclick=()=>startAudio().catch(e=>$('mic').textContent='Audio: '+e.message);
+$('micbtn').onclick=async()=>{
+  if(micReady){
+    releasePTT();micReady=false;
+    if(micProcessor){micProcessor.disconnect();micProcessor.onaudioprocess=null;micProcessor=null}
+    if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null}
+    $('micbtn').textContent='🎤 MIC OFF';$('micbtn').className='';
+    $('mic').textContent='';return;
+  }
   try{
-    const st=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-    const src=ac.createMediaStreamSource(st),mp=ac.createScriptProcessor(2048,1,1),r=ac.sampleRate/8000;
-    mp.onaudioprocess=e=>{
-      if(!S.ptt||!ws||ws.readyState!=1)return;
-      const x=e.inputBuffer.getChannelData(0),n=Math.floor(x.length/r),o=new Uint8Array(n+1);o[0]=3;
-      for(let i=0;i<n;i++){const a=Math.floor(i*r),b=Math.floor((i+1)*r);let s=0;for(let j=a;j<b;j++)s+=x[j];s/=(b-a);
-        const m=Math.sign(s)*Math.log1p(255*Math.min(1,Math.abs(s)))/Math.log(256);o[i+1]=Math.round((m+1)/2*255)}
-      ws.send(o)};
-    src.connect(mp);mp.connect(ac.destination);$('mic').textContent='🎤 microphone ready';
-  }catch(e){$('mic').textContent='mikrofon nedostupan (treba HTTPS ili localhost)'}
+    await startAudio();
+    micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    const src=ac.createMediaStreamSource(micStream);
+    micProcessor=ac.createScriptProcessor(2048,1,1);
+    const silent=ac.createGain();silent.gain.value=0;
+    micProcessor.connect(silent);silent.connect(ac.destination); // bez lokalnog mikrofonskog monitoringa
+    micProcessor.onaudioprocess=e=>{
+      if(!pttHeld||!['USB','LSB'].includes(S.mode)||!ws||ws.readyState!==1)return;
+      const x=e.inputBuffer.getChannelData(0),r=ac.sampleRate/8000;
+      const n=Math.floor(x.length/r),o=new Uint8Array(n+1);o[0]=3;
+      for(let i=0;i<n;i++){
+        const a=Math.floor(i*r),b=Math.min(x.length,Math.floor((i+1)*r));
+        let v=0;for(let j=a;j<b;j++)v+=x[j];v/=Math.max(1,b-a);
+        const m=Math.sign(v)*Math.log1p(255*Math.min(1,Math.abs(v)))/Math.log(256);
+        o[i+1]=Math.round((m+1)/2*255);
+      }
+      if(ws.bufferedAmount<32000)ws.send(o);
+    };
+    src.connect(micProcessor);micReady=true;
+    $('micbtn').textContent='🎤 MIC ON';$('micbtn').className='on';
+    $('mic').textContent='mikrofon spreman';
+  }catch(e){$('mic').textContent='Mikrofon: '+e.message+' (HTTPS ili localhost)'}
 };
 conn();
 </script></body></html>
@@ -1148,6 +1182,9 @@ conn();
 def make_app(radio, password, audio=None):
     app = web.Application(client_max_size=1024 * 1024)
     app['clients'] = set()
+    app['ptt_owner'] = None
+    app['ptt_since'] = 0.0
+    app['ptt_last_audio'] = 0.0
     app['macros'], app['macnames'], app['mycall'], app['grid'] = load_macros()
     root = Path(__file__).parent
 
@@ -1203,10 +1240,25 @@ def make_app(radio, password, audio=None):
                     if m.type == web.WSMsgType.TEXT:
                         d = json.loads(m.data)
                         k = d.get('k')
-                        if k:
+                        if k == 'ptt':
+                            want = bool(d.get('v'))
+                            if want and app['ptt_owner'] is None and radio.state.get('mode') in ('USB','LSB') and audio and audio.dev_out is not None:
+                                app['ptt_owner'] = ws
+                                app['ptt_since'] = time.monotonic()
+                                app['ptt_last_audio'] = time.monotonic()
+                                radio.apply('ptt', 1)
+                            elif not want and app['ptt_owner'] is ws:
+                                app['ptt_owner'] = None
+                                radio.apply('ptt', 0)
+                        elif k == 'cw_stop':
+                            app['ptt_owner'] = None
+                            radio.apply(k, d.get('v'))
+                        elif k and k not in ('ptt',):
                             radio.apply(k, d.get('v'))
                     elif m.type == web.WSMsgType.BINARY and audio and m.data[:1] == b'\x03' \
-                            and radio.state.get('ptt'):
+                            and app['ptt_owner'] is ws and radio.state.get('ptt') \
+                            and radio.state.get('mode') in ('USB','LSB'):
+                        app['ptt_last_audio'] = time.monotonic()
                         audio.play(m.data[1:])
                 except Exception as e:
                     print('cmd err', repr(e))
@@ -1217,12 +1269,24 @@ def make_app(radio, password, audio=None):
         finally:
             app['clients'].discard(ws)
             print('** WS klijent odspojen')
-            if not app['clients'] and radio.state.get('ptt'):   # failsafe: nitko ne drzi PTT
+            if app['ptt_owner'] is ws:
+                app['ptt_owner'] = None
                 radio.apply('ptt', 0)
         return ws
 
     async def on_start(app):
         loop = asyncio.get_running_loop()
+        async def tx_watchdog():
+            while True:
+                await asyncio.sleep(0.25)
+                owner = app['ptt_owner']
+                if owner is not None and (time.monotonic()-app['ptt_since']>180 or
+                                         time.monotonic()-app['ptt_last_audio']>3 or
+                                         radio.state.get('mode') not in ('USB','LSB') or
+                                         owner.closed):
+                    app['ptt_owner'] = None
+                    radio.apply('ptt', 0)
+        app['tx_watchdog_task'] = asyncio.create_task(tx_watchdog())
 
         async def bcast(d):
             for c in list(app['clients']):
@@ -1247,6 +1311,16 @@ def make_app(radio, password, audio=None):
             threading.Thread(target=radio.poll, daemon=True).start()
 
     app.on_startup.append(on_start)
+    async def on_cleanup(app):
+        task = app.get('tx_watchdog_task')
+        if task:
+            task.cancel()
+            try: await task
+            except asyncio.CancelledError: pass
+        if app['ptt_owner'] is not None:
+            app['ptt_owner'] = None
+            radio.apply('ptt', 0)
+    app.on_cleanup.append(on_cleanup)
     app.router.add_get('/', index)
     app.router.add_get('/cw', cw_page)
     app.router.add_get('/api/ping', api_ping)
@@ -1267,6 +1341,8 @@ def make_app(radio, password, audio=None):
             return web.json_response({'ok': False, 'err': 'nema pozivnog znaka'}, status=400)
         freq = int(radio.state.get('freq') or 0)
         mode = str(radio.state.get('mode') or '')
+        if mode in ('USB', 'LSB'):
+            mode = 'SSB'  # ADIF MODE: USB/LSB se zapisuju kao SSB
         count = adif_append(call, rst, rstr, freq, mode, app['mycall'], app['grid'], name, qth)
         return web.json_response({'ok': True, 'count': count})
 
