@@ -17,6 +17,7 @@ Developed by **9A3ZI**. The application is a single Python server with an embedd
 - S-meter, TX power and SWR indications.
 - Optional browser RX/TX audio through the radio's USB audio device.
 - PTT control, CW text transmission, CW stop and a separate CW console with editable macros.
+- SSB operating mode
 - QSO entry and ADIF logging with callsign, sent/received RST, name and QTH.
 - Search, edit and delete QSO records in the web log; backups are created before edits/deletions.
 - Log dates shown as **DD/MM/YYYY** in the table, while ADIF stores the standard **YYYYMMDD** value.
@@ -45,7 +46,8 @@ If you only need CI-V control and logging, `numpy` and `sounddevice` are optiona
 3. The default CI-V address is **94h**, configured by `--addr 94`.
 4. For CW keying using RTS/DTR, configure **USB Keying (CW)** on the radio to match `--keyline` and verify that **USB SEND** does not inadvertently key the transmitter.
 5. For spectrum streaming, the radio must support and provide CI-V scope data. The server requests scope data without intentionally forcing the LCD into the SCOPE screen; actual behavior may vary by radio configuration.
-
+6. For SSB operation IC7300: MENU-SET-CONNECTORS-DATA OFF MODE USB
+7. 
 **Important:** Test CW, PTT and USB control with a dummy load or other safe RF setup before using remote transmit functions.
 
 ## Run the server
