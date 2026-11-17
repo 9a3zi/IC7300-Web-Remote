@@ -21,7 +21,7 @@ Makronaredbe: GET/POST /api/macros (sprema se u ic7300_macros.json pored skripte
 import argparse, asyncio, base64, json, threading, time
 import datetime
 from pathlib import Path
-import serial, struct, ssl, re, os, tempfile, shutil
+import serial, struct, ssl, re, os, tempfile, shutil, secrets, hmac, subprocess
 from aiohttp import web
 try:
     import numpy as np
@@ -37,6 +37,25 @@ MODE_ID = {v: k for k, v in MODES.items()}
 LEVELS = {'af': 0x01, 'rf': 0x02, 'sql': 0x03, 'power': 0x0A, 'cwspd': 0x0C}   # cmd 14 xx
 FLAGS = {'nb': 0x22, 'nr': 0x40, 'anf': 0x41}                    # cmd 16 xx, 0/1
 METERS = {0x02: 'smeter', 0x11: 'pwr_meter', 0x12: 'swr'}        # cmd 15 xx
+
+# Poseban kljuc za gasenje PC-a. Nije dostupan preko web servera.
+SHUTDOWN_KEY_PATH = Path(__file__).with_name('icweb_shutdown_key.txt')
+
+def load_shutdown_key():
+    if SHUTDOWN_KEY_PATH.exists():
+        key = SHUTDOWN_KEY_PATH.read_text(encoding='utf-8').strip()
+        if len(key) < 24:
+            raise RuntimeError('icweb_shutdown_key.txt mora sadrzavati kljuc od barem 24 znaka')
+        return key
+    key = secrets.token_urlsafe(32)
+    # Ekskluzivno kreiranje: nikad ne pregazi postojeci kljuc.
+    try:
+        with SHUTDOWN_KEY_PATH.open('x', encoding='utf-8') as f:
+            f.write(key + '\n')
+    except FileExistsError:
+        return load_shutdown_key()
+    print('[ICWEB] Kljuc za SHUTDOWN PC spremljen u:', SHUTDOWN_KEY_PATH)
+    return key
 
 MACRO_PATH = Path(__file__).with_name('ic7300_macros.json')
 ADIF_PATH = Path(__file__).with_name('ic7300_log.adi')
@@ -210,13 +229,13 @@ def adif_delete(index):
                 tmp.unlink()
 
 
-def norm8(m, limit=120, count=8):
+def norm8(m, limit=1000, count=15):
     """Normaliziraj listu na tocno count stringova (makro M1..)."""
     m = [str(x)[:limit] for x in m][:count]
     return m + [''] * (count - len(m))
 
 
-def norm_names(n, count=8):
+def norm_names(n, count=15):
     """Imena makroa: do 8 znakova; po defaultu M1..M(count)."""
     n = [str(x)[:8] for x in n][:count]
     return n + ['M%d' % (i + 1) for i in range(len(n), count)]
@@ -234,14 +253,24 @@ def load_macros():
 
 
 def save_macros(m, n=None, mycall='', grid=''):
+    """Atomski spremi svih 15 CW makroa; greške se prosljeđuju API-ju."""
+    data = {'macros': norm8(m, count=15),
+            'names': norm_names(n or [], count=15),
+            'mycall': str(mycall)[:12], 'gridsquare': str(grid)[:8]}
+    temp = None
     try:
-        MACRO_PATH.write_text(json.dumps({'macros': norm8(m, count=15),
-                                          'names': norm_names(n or [], count=15),
-                                          'mycall': str(mycall)[:12],
-                                          'gridsquare': str(grid)[:8]},
-                                         ensure_ascii=False, indent=1), encoding='utf-8')
-    except Exception:
-        pass
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                         dir=MACRO_PATH.parent, prefix='.cw_macros_',
+                                         suffix='.tmp', delete=False) as f:
+            temp = Path(f.name)
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, MACRO_PATH)
+    finally:
+        if temp is not None and temp.exists():
+            temp.unlink()
+    return data
 
 
 def bcd_freq(f):
@@ -283,10 +312,11 @@ class Radio:
         self.key_line = keyline        # 'RTS' ili 'DTR' - mora odgovarati postavci
                                        # USB Keying (CW) u radiju
         self._key_down = False
-        self.cw_mode = 'buf'           # 'buf' = 17h buffer, 'key' = USB keying
+        self.cw_mode = 'buf'           # CI-V 17h, bez potrebe za RTS
         self.state = {}
         self.lock = threading.Lock()
         self.on_change = lambda d: None
+        self.on_cw_key = lambda down: None
         self.on_scope = lambda b: None
         self.sc = None
         self.scbuf = bytearray()
@@ -348,6 +378,7 @@ class Radio:
             self.ser.setDTR(down)
         else:
             self.ser.setRTS(down)
+        self.on_cw_key(down)
 
     def _precise_sleep(self, t):
         """Kratko spavanje s ms preciznoscu (hybrid: sleep + busy-wait)."""
@@ -602,8 +633,6 @@ class Radio:
                     time.sleep(6.0)     # i ponovno za svaki slucaj
                     self.scope_init()
                 threading.Thread(target=_reinit, daemon=True).start()
-        elif k == 'cwmode':
-            self.cw_mode = 'key' if v == 'key' else 'buf'     # buffer ili USB keying
         elif k == 'cw':
             self.cw_send(str(v))                              # predaja CW teksta / makroa
         elif k == 'cw_stop':
@@ -829,16 +858,24 @@ function toggleEdit(){
   const box = $('macroinputs'); box.innerHTML = '';
   MACROS.forEach((t, i) => {
     const inp = document.createElement('input');
-    inp.value = t; inp.maxLength = 120;
-    inp.placeholder = 'M' + (i + 1) + ' (max 120 characters)';
+    inp.value = t; inp.maxLength = 1000;
+    inp.placeholder = 'M' + (i + 1) + ' (max 1000 characters)';
     inp.oninput = () => MACROS[i] = inp.value;
     box.appendChild(inp);
   });
 }
-function saveMacros(){
-  fetch('/api/macros', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({macros: MACROS, names: MNAMES})})
-    .then(() => { $('macroedit').style.display = 'none'; build(); });
+async function saveMacros(){
+  try{
+    const r=await fetch('/api/macros',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({macros:MACROS,names:MNAMES})});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.err||'Spremanje nije uspjelo');
+    const check=await fetch('/api/macros',{cache:'no-store'});
+    if(!check.ok)throw Error('Ne mogu potvrditi spremljene makroe');
+    const saved=await check.json();
+    if(JSON.stringify(saved.macros)!==JSON.stringify(MACROS))throw Error('Provjera spremljenih makroa nije uspjela');
+    $('macroedit').style.display='none';build();
+  }catch(e){alert('CW makroi: '+e.message);}
 }
 fetch('/api/macros').then(r => r.json()).then(d => {
   MACROS = (d.macros || []).concat(['','','','','','','','','','','','','','','']).slice(0,15);
@@ -892,7 +929,7 @@ header{display:flex;justify-content:space-between;color:var(--mut);font-size:13p
 .row{display:flex;flex-wrap:wrap;gap:4px;margin:2px 0}
 button{background:#2a3441;color:var(--fg);border:0;border-radius:5px;padding:4px 8px;font-size:12.5px;cursor:pointer}
 button:hover{background:#344255}button.on{background:var(--on)}button.sel{background:var(--acc);color:#000}
-#ptt{flex:1;padding:10px;font-size:16px;font-weight:700;touch-action:none}#ptt.on{background:var(--tx)}
+#ptt,#pttToggle{flex:1;padding:10px;font-size:16px;font-weight:700;touch-action:none}#ptt.on,#pttToggle.on{background:var(--tx)}
 .sl{display:grid;grid-template-columns:56px 1fr 40px;gap:6px;align-items:center;margin:3px 0;font-size:12.5px}
 input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:16px;background:transparent;cursor:pointer}
 input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--on) var(--fill,50%),#3a4553 var(--fill,50%))}
@@ -901,7 +938,37 @@ input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:#3a4
 input[type=range]::-moz-range-progress{height:6px;border-radius:3px;background:var(--on)}
 input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:#e6edf3;border:2px solid var(--on)}
 .meter{height:10px;background:#0b0f14;border-radius:4px;overflow:hidden}.meter div{height:100%;background:linear-gradient(90deg,#2ea043,#f5a524 60%,#e5484d);width:0}
-.grid{display:grid;grid-template-columns:1.15fr 1fr 1.15fr;gap:6px}@media(max-width:760px){.grid{grid-template-columns:1fr}}
+.grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,.9fr) 160px;gap:6px}@media(max-width:820px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){.grid{grid-template-columns:1fr}}
+#vfoWheel{height:116px;width:116px;margin:5px auto 7px;border-radius:50%;border:5px solid #3b4655;background:repeating-conic-gradient(from var(--vfo-angle,0deg),#4b5a6b 0deg 3deg,#1c2530 3deg 12deg);box-shadow:inset 0 0 0 17px #242f3c,0 3px 9px #0008;touch-action:none;cursor:grab;user-select:none;position:relative}
+#vfoWheel:active{cursor:grabbing}#vfoWheel:after{content:"VFO";position:absolute;inset:30px;border-radius:50%;display:grid;place-items:center;background:#101820;color:var(--acc);font-weight:700;font-size:12px;letter-spacing:1px;border:2px solid #566375}
+#vfoStep{width:100%;background:#0b0f14;color:var(--fg);border:1px solid #3b4655;border-radius:4px;padding:4px;font-size:12px}#vfoStatus{text-align:center;font-size:11px;color:var(--mut)}
+/* Kompaktni mjerni instrumenti u retku AUDIO/MIC/VOLUME. */
+.audioMeters{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}
+.metersInline{display:flex;align-items:center;gap:9px;flex:1;justify-content:flex-end;min-width:0}
+.miniMeter{display:grid;grid-template-columns:auto minmax(25px,1fr) 28px;align-items:center;gap:4px;min-width:85px;flex:1;font-size:11px}
+.miniMeter .meter{height:9px}.miniMeter span:last-child{text-align:right;font-size:10px}
+@media(max-width:780px){.audioMeters{flex-wrap:wrap}.metersInline{width:100%;flex-basis:100%}}
+/* Četiri neovisne kartice: MODE, SLIDERS, VFO, ROTATOR. */
+.grid{grid-template-columns:minmax(0,1.25fr) minmax(0,.95fr) 160px 160px}
+@media(max-width:820px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:500px){.grid{grid-template-columns:1fr}}
+#rotWheel{height:116px;width:116px;margin:5px auto 7px;border-radius:50%;border:5px solid #3b4655;background:repeating-conic-gradient(from 0deg,#586878 0deg 2deg,#1c2530 2deg 30deg);box-shadow:inset 0 0 0 14px #242f3c,0 3px 9px #0008;cursor:crosshair;touch-action:none;user-select:none;position:relative}
+#rotWheel:after{content:attr(data-az);position:absolute;inset:26px;border-radius:50%;display:grid;place-items:center;background:#101820;color:#4ce1bb;font-weight:700;font-size:19px;border:2px solid #566375}
+#rotWheel:before{content:none}
+/* Oznake kompasa i pokazivac stvarnog polozaja, ne ciljnog azimuta. */
+.rotDir{position:absolute;z-index:3;font:700 12px Consolas,monospace;color:#e3edf6;pointer-events:none;text-shadow:0 1px 2px #000}
+.rotN{top:3px;left:50%;transform:translateX(-50%);color:#4ce1bb}
+.rotS{bottom:2px;left:50%;transform:translateX(-50%)}
+.rotE{right:5px;top:50%;transform:translateY(-50%)}
+.rotW{left:5px;top:50%;transform:translateY(-50%)}
+#rotNeedle{position:absolute;inset:0;z-index:1;pointer-events:none;transform:rotate(0deg);transform-origin:center;transition:transform .4s linear}
+#rotNeedle:before{content:"";position:absolute;left:calc(50% - 3px);top:13px;width:6px;height:20px;background:#ffb44e;clip-path:polygon(50% 0,100% 100%,0 100%);filter:drop-shadow(0 1px 2px #000)}
+#rotNeedle:after{content:none}
+#rotWheel.rotOffline #rotNeedle{opacity:0}
+#rotWheel:after{z-index:2;pointer-events:none}
+#rotControls input{width:51px;min-width:0;text-align:center;background:#0b0f14;border:1px solid #3b4655;border-radius:4px;color:#f5a524;padding:3px;font-size:12px}
+#rotControls .row{justify-content:center;align-items:center;gap:3px;flex-wrap:nowrap}#rotControls button{padding:4px 6px;font-size:11px}
+#rotStatus{font-size:10px;color:#a6b2bf;line-height:1.2;margin-top:3px}
 h4{margin:0 0 4px;color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase}
 canvas{display:block;background:#0b0f14}
 </style></head><body>
@@ -915,12 +982,16 @@ canvas{display:block;background:#0b0f14}
 <button onclick="tx('vfo','X')">A⇄B</button><button onclick="tx('vfo','EQ')">A=B</button></div>
 <div class="row" id="bands"></div></div>
 
-<div class="card"><canvas id="cv" width="475" height="120" style="width:100%;border-radius:6px;cursor:crosshair"></canvas>
+<div class="card"><canvas id="cv" width="475" height="100" style="width:100%;border-radius:6px;cursor:crosshair"></canvas>
 <div class="row" id="spans" style="align-items:center"></div>
-<div class="row" style="align-items:center;color:var(--mut)">Down <input type="range" id="flo" min="0" max="120" value="20" style="width:90px"> Up <input type="range" id="fhi" min="40" max="160" value="120" style="width:90px"></div></div>
+<div class="row" style="align-items:center;color:var(--mut)">Down <input type="range" id="flo" min="0" max="120" value="20" style="width:90px"> Up <input type="range" id="fhi" min="40" max="160" value="120" style="width:90px"><button type="button" onclick="shutdownPC()" style="background:#903b40;color:#fff;font-weight:700;margin-left:auto">SHUTDOWN PC</button></div></div>
 
-<div class="card" style="padding:6px 8px"><div class="row" style="align-items:center;margin:0"><button id="aud">🔇 Audio</button><button id="micbtn" type="button">🎤 MIC OFF</button>
-<span style="font-size:12px">Volume</span><input type="range" id="vol" min="0" max="200" value="100" style="width:110px"><span id="mic" style="color:var(--mut);font-size:11px"></span></div></div>
+<div class="card" style="padding:6px 8px"><div class="audioMeters">
+<div class="row" style="align-items:center;margin:0;flex-wrap:nowrap;min-width:0"><button id="aud">🔇 Audio</button><button id="micbtn" type="button">🎤 MIC OFF</button>
+<span style="font-size:12px">Volume</span><input type="range" id="vol" min="0" max="200" value="100" style="width:105px;flex:0 1 105px"><span id="mic" style="color:var(--mut);font-size:11px"></span></div>
+<div class="metersInline"><div class="miniMeter"><span>S</span><div class="meter"><div id="m_s"></div></div><span id="t_s"></span></div>
+<div class="miniMeter"><span>PWR</span><div class="meter"><div id="m_p"></div></div><span id="t_p"></span></div>
+<div class="miniMeter"><span>SWR</span><div class="meter"><div id="m_w"></div></div><span id="t_w"></span></div></div></div></div>
 
 <div class="grid">
 <div class="card"><h4>Mode</h4><div class="row" id="modes"></div>
@@ -928,12 +999,13 @@ canvas{display:block;background:#0b0f14}
 <h4 style="margin-top:10px">Functions</h4><div class="row" id="tog"></div>
 <div class="row" id="pre"></div></div>
 
-<div class="card"><h4>Meters</h4>
-<div class="sl"><span>S</span><div class="meter"><div id="m_s"></div></div><span id="t_s"></span></div>
-<div class="sl"><span>PWR</span><div class="meter"><div id="m_p"></div></div><span id="t_p"></span></div>
-<div class="sl"><span>SWR</span><div class="meter"><div id="m_w"></div></div><span id="t_w"></span></div></div>
-
 <div class="card" id="sliders"></div>
+<div class="card" style="text-align:center"><h4>VFO Tuning</h4>
+<div id="vfoWheel" title="hold the left mouse button and move in a circle to select"></div>
+<select id="vfoStep" aria-label="Frequency adjustment step"><option value="10">10 Hz</option><option value="100">100 Hz</option><option value="1000" selected>1 kHz</option><option value="10000">10 kHz</option></select>
+<div id="vfoStatus">Step 1 kHz</div></div>
+<div class="card" style="text-align:center"><h4>Rotator · RAK</h4><div id="rotWheel" class="rotOffline" data-az="---°" title="Strelica pokazuje stvarni azimut rotora"><span class="rotDir rotN">N</span><span class="rotDir rotE">E</span><span class="rotDir rotS">S</span><span class="rotDir rotW">W</span><span id="rotNeedle"></span></div>
+<div id="rotControls"><div class="row"><input id="rotTarget" type="number" min="0" max="359" value="270" aria-label="Željeni azimut"><span>°</span><button id="rotGo" type="button">GO</button><button id="rotStop" type="button" style="background:#903b40">STOP</button></div><div id="rotSafety" style="font:10px Consolas,monospace;color:#e5b45a;line-height:1.3;margin-top:3px">MONITOR: ACTIVE</div><div class="row" style="justify-content:center"><button id="rotReset" type="button" style="background:#60512b">RESET SAFETY</button></div></div></div>
 </div>
 
 <div class="card"><h4></h4>
@@ -941,7 +1013,11 @@ canvas{display:block;background:#0b0f14}
 <div class="row" style="align-items:center"><span style="font-size:12px;color:var(--mut)">My call:</span><input id="mycall" placeholder="Call" maxlength="12" autocomplete="off" onchange="saveMy()" style="flex:0 0 110px;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"><span style="font-size:12px;color:var(--mut);margin-left:8px">My loc:</span><input id="grid" placeholder="JN85" maxlength="8" autocomplete="off" onchange="saveMy()" style="flex:0 0 70px;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"></div>
 <div class="row" id="macros"></div>
 <div class="row"><button onclick="toggleEdit()">Edit macro</button>
-<button id="cwmodebtn" onclick="toggleCWMode()">CW: buffer</button>
+<span style="font-size:12px;color:var(--mut)">CW MONITOR</span>
+<button id="cwmonbtn" type="button" onclick="toggleCWMonitor()">ON</button>
+<label style="font-size:12px">Hz <input id="cwmonhz" type="number" min="400" max="1000" step="50" value="650" style="width:65px" onchange="saveCWMonitor()"></label>
+<label style="font-size:12px">Vol <input id="cwmonvol" type="range" min="0" max="100" value="30" oninput="saveCWMonitor()" style="width:85px"></label>
+<span id="cwmonpct" style="font-size:12px">30%</span>
 </div>
 <div id="medit" style="display:none">
 <div id="minp" style="display:grid;gap:4px;margin:6px 0"></div>
@@ -953,7 +1029,7 @@ canvas{display:block;background:#0b0f14}
 </div>
 </div>
 
-<div class="row"><button id="ptt">PTT (hold)</button><button onclick="tx('tuner',2)">TUNE</button>
+<div class="row"><button id="ptt">PTT (hold)</button><button id="pttToggle">PTT (toggle)</button><button onclick="tx('tuner',2)">TUNE</button>
 <button style="background:var(--tx);font-weight:700" onclick="tx('cw_stop')">STOP TX</button>
 <button onclick="if(confirm('Isključiti IC-7300?'))tx('powerbtn',0)">POWER OFF</button>
 <button onclick="tx('powerbtn',1)" title="Radi samo ako je radio u standbyu (isključen preko softvera, ne na tipku)">POWER ON</button></div>
@@ -983,6 +1059,102 @@ PL.forEach((p,i)=>{
 function goto(){const v=parseFloat($('fin').value.replace(',','.'));if(v>0)tx('freq',Math.round(v*1e6))}
 $('fin').onkeydown=e=>{if(e.key=='Enter')goto()};
 
+// VFO kotač: relativno pomicanje, bez slanja previše CI-V naredbi.
+const vfoWheel=$('vfoWheel'),vfoStep=$('vfoStep');
+let rotTarget=270,rotDrag=null;
+let vfoPending=null,vfoTimer=null,vfoDrag=null,vfoAccum=0;
+vfoStep.value=localStorage.getItem('icweb_vfo_step')||'1000';
+function vfoLabel(){ $('vfoStatus').textContent='Step '+vfoStep.options[vfoStep.selectedIndex].text; }
+vfoStep.onchange=()=>{localStorage.setItem('icweb_vfo_step',vfoStep.value);vfoLabel()};vfoLabel();
+function vfoFlush(){
+  vfoTimer=null;
+  if(vfoPending!==null&&ws&&ws.readyState===1){tx('freq',vfoPending);vfoPending=null;}
+}
+function vfoTune(n){
+  if(!Number.isFinite(S.freq)||!S.freq)return;
+  const base=vfoPending===null?S.freq:vfoPending;
+  const f=Math.max(30000,Math.min(74999999,base+n*Number(vfoStep.value)));
+  vfoPending=Math.round(f);
+  if(vfoTimer===null)vfoTimer=setTimeout(vfoFlush,65);
+}
+vfoWheel.addEventListener('wheel',e=>{e.preventDefault();const n=e.deltaY<0?1:-1;vfoAngle=(vfoAngle+n*15)%360;vfoRotate();vfoTune(n)},{passive:false});
+// Kružno upravljanje: kut miša oko središta kotača; 24 koraka po krugu.
+let vfoAngle=0;
+function vfoPointerAngle(e){
+  const r=vfoWheel.getBoundingClientRect();
+  return Math.atan2(e.clientY-(r.top+r.height/2),e.clientX-(r.left+r.width/2));
+}
+function vfoRotate(){vfoWheel.style.setProperty('--vfo-angle',vfoAngle+'deg');}
+vfoWheel.addEventListener('pointerdown',e=>{
+  if(e.button!==0)return;
+  vfoDrag={id:e.pointerId,angle:vfoPointerAngle(e)};
+  vfoAccum=0;
+  vfoWheel.setPointerCapture(e.pointerId);e.preventDefault();
+});
+vfoWheel.addEventListener('pointermove',e=>{
+  if(!vfoDrag||e.pointerId!==vfoDrag.id)return;
+  const angle=vfoPointerAngle(e);
+  // Normalizacija prijelaza preko -180 / +180 stupnjeva.
+  let delta=angle-vfoDrag.angle;
+  if(delta>Math.PI)delta-=2*Math.PI;
+  if(delta<-Math.PI)delta+=2*Math.PI;
+  vfoDrag.angle=angle;
+  vfoAngle=(vfoAngle+delta*180/Math.PI)%360;
+  vfoRotate();
+  vfoAccum+=delta;
+  const n=Math.trunc(vfoAccum/(Math.PI/12));
+  if(n){vfoAccum-=n*(Math.PI/12);vfoTune(n);}
+});
+function vfoEnd(e){if(vfoDrag&&e.pointerId===vfoDrag.id){vfoDrag=null;vfoAccum=0;}}
+vfoWheel.addEventListener('pointerup',vfoEnd);
+vfoWheel.addEventListener('pointercancel',vfoEnd);
+// PC se gasi samo nakon dvostruke potvrde i provjere tajnog kljuca na serveru.
+async function shutdownPC(){
+  if(!confirm('Iskljuciti udaljeni Windows PC? ICweb i Murmur prestat ce raditi.'))return;
+  const key=prompt('Upisi sigurnosni kljuc za SHUTDOWN PC:');
+  if(!key)return;
+  if(!confirm('POSLJEDNJA POTVRDA: zaista iskljuciti PC?'))return;
+  try{
+    const r=await fetch('/api/pc/shutdown',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      credentials:'same-origin',cache:'no-store',body:JSON.stringify({key})
+    });
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.err||'Gasenje nije uspjelo');
+    alert('Naredba za gasenje Windows PC-a prihvacena.');
+  }catch(e){alert('SHUTDOWN PC: '+e.message)}
+}
+// Zaseban rotator kotačić: klik bira cilj, strelica pokazuje stvarni položaj.
+const rotWheel=$('rotWheel');
+function setRotTarget(deg){
+  rotTarget=((Math.round(deg)%360)+360)%360;
+  $('rotTarget').value=rotTarget;
+  // Odabir cilja zasad ne pokrece motor.
+}
+function rotPointer(e){
+  const r=rotWheel.getBoundingClientRect();
+  const dx=e.clientX-(r.left+r.width/2),dy=e.clientY-(r.top+r.height/2);
+  setRotTarget(Math.atan2(dx,-dy)*180/Math.PI);
+}
+rotWheel.addEventListener('pointerdown',e=>{
+  if(e.button!==0)return;
+  rotDrag={id:e.pointerId};rotWheel.setPointerCapture(e.pointerId);rotPointer(e);e.preventDefault();
+});
+rotWheel.addEventListener('pointermove',e=>{if(rotDrag&&rotDrag.id===e.pointerId)rotPointer(e)});
+function rotEnd(e){if(rotDrag&&rotDrag.id===e.pointerId)rotDrag=null}
+rotWheel.addEventListener('pointerup',rotEnd);
+rotWheel.addEventListener('pointercancel',rotEnd);
+rotWheel.addEventListener('wheel',e=>{e.preventDefault();setRotTarget(rotTarget+(e.deltaY<0?1:-1))},{passive:false});
+$('rotTarget').onchange=()=>setRotTarget(Number($('rotTarget').value)||0);
+$('rotGo').onclick=()=>{
+  if(S.rot_connected!==true){alert('Nema veze s rotatorom.');return;}
+  const target=Number($('rotTarget').value);
+  if(!Number.isInteger(target)||target<0||target>359){alert('Azimut mora biti 0-359.');return;}
+  tx('rot_go',target);
+};
+$('rotStop').onclick=()=>tx('rot_stop',1);
+$('rotReset').onclick=()=>{if(confirm('RESET SAFETY samo nakon provjere da rotor miruje i da su granice sigurne. Nastaviti?'))tx('rot_reset',1)};
+
 // UI elementi
 for(const[b,f]of BANDS){const e=document.createElement('button');e.textContent=b+'m';e.onclick=()=>tx('freq',f);$('bands').appendChild(e)}
 MODES.forEach(m=>{const e=document.createElement('button');e.textContent=m;e.id='mode_'+m;e.onclick=()=>tx('mode',m);$('modes').appendChild(e)});
@@ -998,11 +1170,114 @@ document.querySelectorAll('input[type=range]').forEach(setFill);   // pocetna is
 
 // CW makronaredbe M1-M8 + direktni unos
 let MACROS=['','','','','','','','','','','','','','',''],MNAMES=['M1','M2','M3','M4','M5','M6','M7','M8','M9','M10','M11','M12','M13','M14','M15'];
-let CWKEY=localStorage.getItem('cwkey')==='1';
-if(CWKEY){$('cwmodebtn').textContent='CW: KEYING';$('cwmodebtn').className='on'}
-function toggleCWMode(){CWKEY=!CWKEY;localStorage.setItem('cwkey',CWKEY?'1':'0');
-  $('cwmodebtn').textContent=CWKEY?'CW: KEYING':'CW: buffer';
-  $('cwmodebtn').className=CWKEY?'on':'';tx('cwmode',CWKEY?'key':'buf')}
+// Lokalni Web Audio sidetone prati RTS/DTR key događaje s poslužitelja.
+let cwMonitorEnabled=localStorage.getItem('cwmon_enabled')!=='0';
+let cwMonitorHz=+(localStorage.getItem('cwmon_hz')||650);
+let cwMonitorVol=+(localStorage.getItem('cwmon_vol')||30);
+let cwAudioCtx=null,cwOsc=null,cwGain=null;
+$('cwmonhz').value=cwMonitorHz;$('cwmonvol').value=cwMonitorVol;
+function saveCWMonitor(){
+  cwMonitorHz=Math.max(400,Math.min(1000,+$('cwmonhz').value||650));
+  cwMonitorVol=Math.max(0,Math.min(100,+$('cwmonvol').value||0));
+  $('cwmonhz').value=cwMonitorHz;$('cwmonpct').textContent=cwMonitorVol+'%';
+  localStorage.setItem('cwmon_hz',cwMonitorHz);
+  localStorage.setItem('cwmon_vol',cwMonitorVol);
+  if(cwOsc)cwOsc.frequency.setTargetAtTime(cwMonitorHz,cwAudioCtx.currentTime,.005);
+  if(!cwMonitorEnabled)cwMonitorStop();
+}
+function initCWAudio(){
+  if(!cwAudioCtx){
+    cwAudioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    cwOsc=cwAudioCtx.createOscillator();cwGain=cwAudioCtx.createGain();
+    cwOsc.type='sine';cwOsc.frequency.value=cwMonitorHz;cwGain.gain.value=0;
+    cwOsc.connect(cwGain);cwGain.connect(cwAudioCtx.destination);cwOsc.start();
+  }
+  if(cwAudioCtx.state==='suspended')cwAudioCtx.resume();
+}
+function cwTone(down){
+  if(!cwAudioCtx||!cwGain)return;
+  const t=cwAudioCtx.currentTime;
+  cwGain.gain.cancelScheduledValues(t);
+  cwGain.gain.setTargetAtTime(down&&cwMonitorEnabled?cwMonitorVol/100*0.20:0,t,.003);
+}
+function toggleCWMonitor(){
+  cwMonitorEnabled=!cwMonitorEnabled;
+  localStorage.setItem('cwmon_enabled',cwMonitorEnabled?'1':'0');
+  updateCWMonitorUI();
+  if(cwMonitorEnabled)initCWAudio();else cwMonitorStop();
+}
+function updateCWMonitorUI(){
+  $('cwmonbtn').textContent=cwMonitorEnabled?'ON':'OFF';
+  $('cwmonbtn').className=cwMonitorEnabled?'on':'';
+}
+updateCWMonitorUI();saveCWMonitor();
+// Preglednici dopuštaju zvuk tek nakon korisničkog klika/tipa.
+document.addEventListener('pointerdown',()=>{if(cwMonitorEnabled)initCWAudio()},{passive:true});
+document.addEventListener('keydown',()=>{if(cwMonitorEnabled)initCWAudio()});
+
+const CW_MORSE={A:'.-',B:'-...',C:'-.-.',D:'-..',E:'.',F:'..-.',G:'--.',H:'....',I:'..',J:'.---',K:'-.-',L:'.-..',M:'--',N:'-.',O:'---',P:'.--.',Q:'--.-',R:'.-.',S:'...',T:'-',U:'..-',V:'...-',W:'.--',X:'-..-',Y:'-.--',Z:'--..',
+'0':'-----','1':'.----','2':'..---','3':'...--','4':'....-','5':'.....','6':'-....','7':'--...','8':'---..','9':'----.',
+'/':'-..-.','?':'..--..','.':'.-.-.-',',':'--..--','=':'-...-','+':'.-.-.','-':'-....-','@':'.--.-.',':':'---...'};
+// CW monitor: rasporedjuje samo kratki dio unaprijed; nova WPM vrijednost
+// koristi se za svaki sljedeci element, bez rasporedjivanja cijelog makroa.
+let cwMonitorEnd=0, cwMonitorTimer=null, cwMonitorEvents=[], cwMonitorIndex=0;
+function cwMonitorStop(){
+  if(cwMonitorTimer!==null){clearInterval(cwMonitorTimer);cwMonitorTimer=null;}
+  cwMonitorEvents=[];cwMonitorIndex=0;
+  if(!cwAudioCtx||!cwGain)return;
+  const now=cwAudioCtx.currentTime;
+  cwGain.gain.cancelScheduledValues(now);
+  cwGain.gain.setTargetAtTime(0,now,.003);
+  cwMonitorEnd=now;
+}
+function cwMonitorPlay(text,wpm){
+  cwMonitorStop();
+  if(!cwMonitorEnabled)return;
+  initCWAudio();
+  if(!cwAudioCtx||!cwGain)return;
+  // Eventi su {on,units}; 1u = 1.2/WPM sekundi.
+  let started=false,gap=false;
+  for(const c of String(text).toUpperCase()){
+    if(c===' '){gap=true;continue;}
+    const code=CW_MORSE[c];if(!code)continue;
+    if(started)cwMonitorEvents.push({on:false,units:gap?7:3});
+    started=true;gap=false;
+    for(let i=0;i<code.length;i++){
+      if(i)cwMonitorEvents.push({on:false,units:1});
+      cwMonitorEvents.push({on:true,units:code[i]==='.'?1:3});
+    }
+  }
+  if(!cwMonitorEvents.length)return;
+  cwMonitorIndex=0;
+  cwMonitorEnd=cwAudioCtx.currentTime+.08;
+  // Pocetni WPM je rezervna vrijednost dok ne stigne novo stanje radija.
+  const fallbackWpm=+wpm||20;
+  const tick=()=>{
+    if(!cwAudioCtx||!cwGain)return;
+    const ctx=cwAudioCtx,g=cwGain.gain;
+    while(cwMonitorIndex<cwMonitorEvents.length && cwMonitorEnd<ctx.currentTime+.10){
+      const ev=cwMonitorEvents[cwMonitorIndex++];
+      const speed=Math.max(5,Math.min(60,Number(S.cwspd)||fallbackWpm));
+      const duration=ev.units*1.2/speed;
+      const t=Math.max(cwMonitorEnd,ctx.currentTime+.005);
+      const level=cwMonitorVol/100*.20;
+      if(ev.on){
+        g.setValueAtTime(0,t);
+        g.linearRampToValueAtTime(level,t+.003);
+        g.setValueAtTime(level,Math.max(t+.003,t+duration-.003));
+        g.linearRampToValueAtTime(0,t+duration);
+      }else{
+        g.setValueAtTime(0,t);
+      }
+      cwMonitorEnd=t+duration;
+    }
+    if(cwMonitorIndex>=cwMonitorEvents.length){
+      clearInterval(cwMonitorTimer);cwMonitorTimer=null;
+    }
+  };
+  tick();
+  if(cwMonitorIndex<cwMonitorEvents.length)cwMonitorTimer=setInterval(tick,25);
+}
 function cwSub(t){return t.replace(/\(call\)/g,($('callsign').value||'').trim().toUpperCase())
   .replace(/\(rst\)/g,($('rst').value||'').trim().toUpperCase())}
 function buildMacros(){const box=$('macros');box.innerHTML='';
@@ -1017,17 +1292,32 @@ function renameMacro(i){
 }
 function toggleEdit(){const ed=$('medit');ed.style.display=ed.style.display=='none'?'block':'none';
   const box=$('minp');box.innerHTML='';
-  MACROS.forEach((t,i)=>{const e=document.createElement('input');e.value=t;e.maxLength=120;
-    e.placeholder=MNAMES[i]+' (max 120 characters)';
+  MACROS.forEach((t,i)=>{const e=document.createElement('input');e.value=t;e.maxLength=1000;
+    e.placeholder=MNAMES[i]+' (max 1000 characters)';
     e.style.cssText='padding:8px;border-radius:6px;border:0;background:#0b0f14;color:var(--fg);font-family:ui-monospace,monospace';
     e.oninput=()=>MACROS[i]=e.value;box.appendChild(e)})}
-function saveMy(){fetch('/api/macros',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({macros:MACROS,names:MNAMES,mycall:($('mycall').value||'').trim().toUpperCase(),
-    gridsquare:($('grid').value||'').trim().toUpperCase()})})}
-function saveMacros(){fetch('/api/macros',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({macros:MACROS,names:MNAMES,mycall:($('mycall').value||'').trim().toUpperCase(),
-    gridsquare:($('grid').value||'').trim().toUpperCase()})})
-  .then(()=>{$('medit').style.display='none';buildMacros()})}
+async function persistMacros(closeEditor=false){
+  try{
+    const payload={macros:MACROS,names:MNAMES,
+      mycall:($('mycall').value||'').trim().toUpperCase(),
+      gridsquare:($('grid').value||'').trim().toUpperCase()};
+    const r=await fetch('/api/macros',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.err||'Spremanje nije uspjelo');
+    const check=await fetch('/api/macros',{cache:'no-store'});
+    if(!check.ok)throw Error('Ne mogu potvrditi spremljene makroe');
+    const saved=await check.json();
+    if(JSON.stringify(saved.macros)!==JSON.stringify(MACROS)||
+       JSON.stringify(saved.names)!==JSON.stringify(MNAMES)||
+       saved.mycall!==payload.mycall||saved.gridsquare!==payload.gridsquare)
+      throw Error('Podaci nakon spremanja nisu jednaki unesenima');
+    if(closeEditor)$('medit').style.display='none';
+    buildMacros();
+  }catch(e){alert('CW makroi: '+e.message);}
+}
+function saveMy(){return persistMacros(false)}
+function saveMacros(){return persistMacros(true)}
 function sendCW(){const e=$('cwtxt');if(e.value.trim())tx('cw',cwSub(e.value));e.value='';e.focus()}
 function saveQSO(){
   const call=($('callsign').value||'').trim().toUpperCase(),rst=($('rst').value||'').trim().toUpperCase()||'599',
@@ -1058,33 +1348,71 @@ fetch('/api/macros').then(r=>r.json()).then(d=>{
   if(d.gridsquare)$('grid').value=d.gridsquare;
   buildMacros()});
 
-// PTT: drži za TX (i touch)
-const ptt=$('ptt');
-let pttHeld=false;
-ptt.addEventListener('pointerdown',e=>{
+// PTT HOLD i PTT TOGGLE dijele isti mikrofon i istu TX vezu.
+const ptt=$('ptt'), pttToggle=$('pttToggle');
+let pttHeld=false, pttLatched=false;
+function pttReady(){
   if(!micReady || !['USB','LSB'].includes(S.mode)){
-    $('mic').textContent='SSB TX: uključi MIC i odaberi USB/LSB';return;
+    $('mic').textContent='SSB TX: uključi MIC i odaberi USB/LSB';return false;
   }
-  if(!ws || ws.readyState!==1)return;
-  pttHeld=true;ptt.setPointerCapture(e.pointerId);tx('ptt',1);
+  return !!ws && ws.readyState===1;
+}
+function pttActive(){return pttHeld||pttLatched}
+function releasePTT(){
+  if(!pttHeld)return;
+  pttHeld=false;
+  if(!pttLatched)tx('ptt',0);
+  render();
+}
+ptt.addEventListener('pointerdown',e=>{
+  if(!pttReady() || pttLatched)return;
+  pttHeld=true;ptt.setPointerCapture(e.pointerId);tx('ptt',1);render();
 });
-function releasePTT(){if(pttHeld){pttHeld=false;tx('ptt',0)}}
 ptt.addEventListener('pointerup',releasePTT);
 ptt.addEventListener('pointercancel',releasePTT);
+pttToggle.addEventListener('click',()=>{
+  if(pttLatched){
+    pttLatched=false;
+    if(!pttHeld)tx('ptt',0);
+  }else{
+    if(!pttReady() || pttHeld)return;
+    pttLatched=true;tx('ptt',1);
+  }
+  render();
+});
+// HOLD se otpušta gubitkom fokusa, TOGGLE ostaje uključen.
 addEventListener('blur',releasePTT);
-addEventListener('pagehide',releasePTT);
+// Zatvaranje stranice otpušta PTT (server dodatno otpušta pri prekidu WS veze).
+addEventListener('pagehide',()=>{pttHeld=false;pttLatched=false;tx('ptt',0)});
 
 $('txf').onclick=()=>tx('txfreq',1);
 function fmtT(hz){return Math.floor(hz/1e6)+'.'+String(Math.floor(hz%1e6/1e3)).padStart(3,'0')+'.'+String(Math.floor(hz%1e3/10)).padStart(2,'0')}
 function sTxt(v){if(v<=120)return'S'+Math.round(v/120*9);return'S9+'+Math.round((v-120)/121*60)+'dB'}
 function render(){
+  if(S.rot_connected===true && Number.isFinite(S.rot_az)){
+    rotWheel.dataset.az=Math.round(S.rot_az)+'°';
+    rotWheel.classList.remove('rotOffline');
+    // RAW daje kontinuirani mehanicki kut kroz sjever (bez skoka strelice na 0).
+    const needleDeg=Number.isFinite(S.rot_raw)?S.rot_raw:S.rot_az;
+    $('rotNeedle').style.transform='rotate('+needleDeg+'deg)';
+    $('rotSafety').textContent=(S.rot_fault?'SAFETY LOCK: '+S.rot_fault+' · '+(S.rot_stop_result||''):'MONITOR: ACTIVE');
+    $('rotSafety').style.color=S.rot_fault?'#ff7474':'#e5b45a';
+    $('rotGo').disabled=!!S.rot_fault;
+  } else if(S.rot_connected===false){
+    rotWheel.dataset.az='---°';
+    rotWheel.classList.add('rotOffline');
+    $('rotSafety').textContent=S.rot_fault?'SAFETY LOCK: '+S.rot_fault+' · '+(S.rot_stop_result||''):'MONITOR: NEMA VEZE';
+    $('rotGo').disabled=!!S.rot_fault;
+  }
   if(S.freq!=null){const s=String(S.freq).padStart(8,'0');PL.forEach((p,i)=>$('d'+i).textContent=s[i])}
   MODES.forEach(m=>$('mode_'+m).className=S.mode==m?'sel':'');
   [1,2,3].forEach(f=>$('filt_'+f).className=S.filt===f?'sel':'');
   TOG.forEach(([k])=>$('tog_'+k).className=S[k]?'on':'');
   PRE.forEach(([v])=>$('pre_'+v).className=S.preamp==v?'sel':'');
   SL.forEach(([k])=>{if(S[k]!=null&&document.activeElement!==$('s_'+k)){$('s_'+k).value=S[k];setFill($('s_'+k));$('v_'+k).textContent=PCT.includes(k)?Math.round(S[k]/2.55):S[k]}});
-  ptt.className=S.ptt?'on':'';
+  ptt.className=pttHeld?'on':'';
+  pttToggle.className=pttLatched?'on':'';
+  pttToggle.textContent=pttLatched?'PTT ON (click OFF)':'PTT (toggle)';
   if(S.split&&S.txfreq!=null){$('txf').style.display='block';$('txf').textContent='TX '+fmtT(S.txfreq)}
   else $('txf').style.display='none';
   $('splitb').style.display=S.split?'inline':'none';
@@ -1095,13 +1423,13 @@ function render(){
 function conn(){
   ws=new WebSocket((location.protocol=='https:'?'wss':'ws')+'://'+location.host+'/ws');
   ws.onopen=()=>{ws.binaryType='arraybuffer';$('st').textContent='● connected';
-    tx('cwmode',CWKEY?'key':'buf')};
-  ws.onclose=()=>{pttHeld=false;$('st').textContent='○ disconnected';setTimeout(conn,1500)};
-  ws.onmessage=e=>{if(typeof e.data!=='string')return onBin(e.data);Object.assign(S,JSON.parse(e.data));render()};
+    };
+  ws.onclose=()=>{cwMonitorStop();pttHeld=false;pttLatched=false;render();$('st').textContent='○ disconnected';setTimeout(conn,1500)};
+  ws.onmessage=e=>{if(typeof e.data!=='string')return onBin(e.data);const msg=JSON.parse(e.data);if(msg.cw_monitor){cwMonitorPlay(msg.cw_monitor.text,msg.cw_monitor.wpm);return;}if(msg.cw_monitor_stop){cwMonitorStop();return;}Object.assign(S,msg);if(msg.ptt===0 && pttLatched && !pttHeld){pttLatched=false;}render()};
 }
 
 // ---------- waterfall ----------
-const cv=$('cv'),cx=cv.getContext('2d'),W=475,H=120,SH=40;let sc={lo:0,hi:0};
+const cv=$('cv'),cx=cv.getContext('2d'),W=475,H=100,SH=40;let sc={lo:0,hi:0};
 const STOPS=[[0,0,0],[0,0,140],[0,200,220],[255,230,0],[255,40,0]];
 const LUT=Array.from({length:256},(_,i)=>{const x=i/255*4,j=Math.min(3,x|0),f=x-j;return STOPS[j].map((a,k)=>a+(STOPS[j+1][k]-a)*f)});
 cx.fillStyle='#0b0f14';cx.fillRect(0,0,W,H);
@@ -1127,7 +1455,7 @@ function onBin(buf){const v=new DataView(buf),t=v.getUint8(0);
   if(t==1){sc.lo=v.getUint32(1);sc.hi=v.getUint32(5);drawScope(new Uint8Array(buf,9))}
   else if(t==2)playRx(new Uint8Array(buf,1))}
 function playRx(d){
-  if(!ac||S.ptt)return;
+  if(!ac||pttActive())return; // RX audio ne čeka zakašnjelo CI-V PTT stanje
   const f=new Float32Array(d.length);
   for(let i=0;i<d.length;i++){const y=d[i]/255*2-1;f[i]=Math.sign(y)*(Math.pow(256,Math.abs(y))-1)/255}
   const b=ac.createBuffer(1,f.length,8000);b.copyToChannel(f,0);
@@ -1144,7 +1472,7 @@ async function startAudio(){
 $('aud').onclick=()=>startAudio().catch(e=>$('mic').textContent='Audio: '+e.message);
 $('micbtn').onclick=async()=>{
   if(micReady){
-    releasePTT();micReady=false;
+    releasePTT();if(pttLatched){pttLatched=false;tx('ptt',0);render()}micReady=false;
     if(micProcessor){micProcessor.disconnect();micProcessor.onaudioprocess=null;micProcessor=null}
     if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null}
     $('micbtn').textContent='🎤 MIC OFF';$('micbtn').className='';
@@ -1158,7 +1486,7 @@ $('micbtn').onclick=async()=>{
     const silent=ac.createGain();silent.gain.value=0;
     micProcessor.connect(silent);silent.connect(ac.destination); // bez lokalnog mikrofonskog monitoringa
     micProcessor.onaudioprocess=e=>{
-      if(!pttHeld||!['USB','LSB'].includes(S.mode)||!ws||ws.readyState!==1)return;
+      if(!pttActive()||!['USB','LSB'].includes(S.mode)||!ws||ws.readyState!==1)return;
       const x=e.inputBuffer.getChannelData(0),r=ac.sampleRate/8000;
       const n=Math.floor(x.length/r),o=new Uint8Array(n+1);o[0]=3;
       for(let i=0;i<n;i++){
@@ -1171,7 +1499,7 @@ $('micbtn').onclick=async()=>{
     };
     src.connect(micProcessor);micReady=true;
     $('micbtn').textContent='🎤 MIC ON';$('micbtn').className='on';
-    $('mic').textContent='mikrofon spreman';
+    $('mic').textContent='mic ready';
   }catch(e){$('mic').textContent='Mikrofon: '+e.message+' (HTTPS ili localhost)'}
 };
 conn();
@@ -1179,13 +1507,96 @@ conn();
 """
 
 
+
+class AlfaSpidReader:
+    """Samo citanje polozaja RAK kontrolera; ne sadrzi naredbe za pokretanje."""
+    QUERY = bytes.fromhex('57 00 00 00 00 00 00 00 00 00 00 1F 20')
+    STOP = bytes.fromhex('57 00 00 00 00 00 00 00 00 00 00 0F 20')
+    # Potvrdeno na stvarnom kontroleru: dva kraja na 180 stupnjeva
+    # imaju razlicite RAW vrijednosti (-180 i +180).
+    MIN_RAW, MAX_RAW = -180, 180
+
+    def __init__(self, port='COM6', baud=1200):
+        self.port, self.baud = port, baud
+        self.ser = None
+        self.last_error = ''
+
+    def close(self):
+        if self.ser is not None:
+            try: self.ser.close()
+            except Exception: pass
+        self.ser = None
+
+    def stop(self):
+        if self.ser is None:
+            raise RuntimeError('COM6 nije otvoren')
+        self.ser.write(self.STOP)
+        self.ser.flush()
+        # STOP vraca 5 bajtova, ali ce ih sljedeci STATUS ocitati nakon resetiranja buffera.
+
+    def go(self, az, current_raw):
+        if type(az) is not int or not 0 <= az <= 359:
+            raise ValueError('Neispravan azimut')
+        if type(current_raw) is not int or not self.MIN_RAW <= current_raw <= self.MAX_RAW:
+            raise ValueError('Stvarni polozaj nije potvrden unutar dozvoljenog raspona')
+        raw = az if az <= 179 else az - 360
+        if not self.MIN_RAW <= raw <= self.MAX_RAW:
+            raise ValueError('Cilj izvan dozvoljenog raspona')
+        if self.ser is None:
+            raise RuntimeError('COM6 nije otvoren')
+        h = f'{raw+360:03d}0'.encode('ascii')
+        packet = b'\x57' + h + b'\x00'*6 + b'\x2f\x20'
+        assert len(packet) == 13
+        self.ser.write(packet)
+        self.ser.flush()
+
+    def read(self):
+        try:
+            if self.ser is None:
+                dev = serial.Serial()
+                dev.port, dev.baudrate = self.port, self.baud
+                dev.bytesize, dev.parity, dev.stopbits = 8, 'N', 1
+                dev.timeout, dev.write_timeout = 1.5, 1.5
+                dev.rtscts, dev.dsrdtr = False, False
+                dev.rts, dev.dtr = False, False
+                dev.open()
+                self.ser = dev
+            self.ser.reset_input_buffer()
+            self.ser.write(self.QUERY)
+            self.ser.flush()
+            response = self.ser.read(5)
+            if len(response) != 5 or response[0] != 0x57 or response[4] != 0x20:
+                raise ValueError('Neispravan odgovor: ' + response.hex(' '))
+            raw = response[1] * 100 + response[2] * 10 + response[3] - 360
+            if not -360 <= raw <= 720:
+                raise ValueError('Azimut izvan raspona')
+            self.last_error = ''
+            return {'rot_connected': True, 'rot_az': raw % 360, 'rot_raw': raw, 'rot_wire': response.hex(' ').upper()}
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.close()
+            return {'rot_connected': False, 'rot_az': None, 'rot_error': self.last_error[:140]}
+
 def make_app(radio, password, audio=None):
     app = web.Application(client_max_size=1024 * 1024)
+    app['shutdown_key'] = load_shutdown_key()
+    app['shutdown_attempts'] = {}
     app['clients'] = set()
+    app['rotor'] = AlfaSpidReader()
+    app['rot_state'] = {'rot_connected': False, 'rot_az': None}
+    app['rot_lock'] = asyncio.Lock()
+    # Vrijednosti koje se mijenjaju nakon pokretanja drzimo u obicnom dict-u.
+    # aiohttp Application stanje ostaje nepromijenjeno nakon startup-a.
+    app['rot_runtime'] = {
+        'rot_last_read': 0.0, 'rot_target': None, 'rot_monitor_events': [],
+        'rot_fault': None, 'rot_stop_result': '', 'rot_last_good': None,
+        'rot_go_at': None,
+    }
     app['ptt_owner'] = None
     app['ptt_since'] = 0.0
     app['ptt_last_audio'] = 0.0
-    app['macros'], app['macnames'], app['mycall'], app['grid'] = load_macros()
+    app['macros'], app['macnames'], initial_mycall, initial_grid = load_macros()
+    app['macro_identity'] = {'mycall': initial_mycall, 'grid': initial_grid}
     root = Path(__file__).parent
 
     @web.middleware
@@ -1209,24 +1620,65 @@ def make_app(radio, password, audio=None):
     async def cw_page(_):
         return web.Response(text=CW_PAGE, content_type='text/html', charset='utf-8')
 
+    async def api_pc_shutdown(req):
+        # POST + zaseban tajni kljuc. Bez ispravnog kljuca nema gasenja.
+        if os.name != 'nt':
+            return web.json_response({'ok': False, 'err': 'Podrzan je samo Windows'}, status=400)
+        # Browser mora dolaziti sa samog ICweb origin-a; blokira cross-site POST.
+        origin = req.headers.get('Origin', '')
+        expected = f'{req.scheme}://{req.host}'
+        if not origin or origin != expected:
+            return web.json_response({'ok': False, 'err': 'Neispravan Origin'}, status=403)
+        client = req.remote or 'unknown'
+        now = time.monotonic()
+        attempts = app['shutdown_attempts']
+        attempts[client] = [t for t in attempts.get(client, []) if now - t < 300]
+        if len(attempts[client]) >= 5:
+            return web.json_response({'ok': False, 'err': 'Previse pokusaja. Pricekaj 5 minuta.'}, status=429)
+        try:
+            payload = await req.json()
+            key = payload.get('key', '')
+        except Exception:
+            key = ''
+        if not isinstance(key, str) or not hmac.compare_digest(key, app['shutdown_key']):
+            attempts[client].append(now)
+            return web.json_response({'ok': False, 'err': 'Pogresan sigurnosni kljuc'}, status=403)
+        # 15 s odgode da browser primi potvrdu, bez prisilnog zatvaranja aplikacija.
+        try:
+            subprocess.Popen(['shutdown.exe', '/s', '/t', '15'],
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except Exception as exc:
+            return web.json_response({'ok': False, 'err': 'Windows nije prihvatio gasenje: '+str(exc)[:120]}, status=500)
+        print('[ICWEB] SHUTDOWN PC potvrden; Windows se gasi za 15 sekundi')
+        return web.json_response({'ok': True})
+
     async def api_ping(_):
         return web.json_response({'ok': True, 'radio_connected': bool(radio.ser)})
 
     async def api_macros_get(_):
         return web.json_response({'macros': app['macros'], 'names': app['macnames'],
-                                  'mycall': app['mycall'], 'gridsquare': app['grid']})
+                                  'mycall': app['macro_identity']['mycall'], 'gridsquare': app['macro_identity']['grid']})
 
     async def api_macros_post(req):
         try:
             d = await req.json()
-            app['macros'] = norm8(d.get('macros', []))
-            app['macnames'] = norm_names(d.get('names', app['macnames']))
-            app['mycall'] = str(d.get('mycall', app['mycall']))[:12]
-            app['grid'] = str(d.get('gridsquare', app['grid']))[:8]
-            save_macros(app['macros'], app['macnames'], app['mycall'], app['grid'])
-        except Exception:
-            return web.json_response({'ok': False}, status=400)
-        return web.json_response({'ok': True})
+            if not isinstance(d, dict):
+                raise ValueError('Neispravan JSON zahtjev')
+            # /cw ne salje mycall/gridsquare: sacuvaj postojece vrijednosti.
+            macros = norm8(d.get('macros', app['macros']), count=15)
+            names = norm_names(d.get('names', app['macnames']), count=15)
+            mycall = str(d.get('mycall', app['macro_identity']['mycall']))[:12]
+            grid = str(d.get('gridsquare', app['macro_identity']['grid']))[:8]
+            saved = save_macros(macros, names, mycall, grid)
+            # Stanje u memoriji mijenjamo tek nakon uspjesnog zapisa na disk.
+            app['macros'][:] = saved['macros']
+            app['macnames'][:] = saved['names']
+            app['macro_identity']['mycall'] = saved['mycall']
+            app['macro_identity']['grid'] = saved['gridsquare']
+        except Exception as exc:
+            print('!! CW makroi - greska spremanja:', repr(exc))
+            return web.json_response({'ok': False, 'err': str(exc)}, status=400)
+        return web.json_response({'ok': True, 'count': len(app['macros'])})
 
     async def ws_handler(req):
         ws = web.WebSocketResponse(heartbeat=10)
@@ -1235,12 +1687,45 @@ def make_app(radio, password, audio=None):
         print('** WS klijent spojen:', req.remote)
         try:
             await ws.send_str(json.dumps(radio.state))
+            await ws.send_str(json.dumps(app['rot_state']))
             async for m in ws:
                 try:
                     if m.type == web.WSMsgType.TEXT:
                         d = json.loads(m.data)
                         k = d.get('k')
-                        if k == 'ptt':
+                        if k in ('rot_go', 'rot_stop', 'rot_reset'):
+                            try:
+                                async with app['rot_lock']:
+                                    if k == 'rot_stop':
+                                        await asyncio.to_thread(app['rotor'].stop)
+                                        app['rot_runtime']['rot_target'] = None
+                                        app['rot_runtime']['rot_go_at'] = None
+                                    elif k == 'rot_reset':
+                                        state = app['rot_state']
+                                        if not state.get('rot_connected') or not isinstance(state.get('rot_raw'), int) or not -180 <= state['rot_raw'] <= 180:
+                                            raise ValueError('RESET odbijen: nema valjanog RAW ocitanja')
+                                        if time.monotonic() - app['rot_runtime']['rot_last_read'] > 3:
+                                            raise ValueError('RESET odbijen: ocitanje zastarjelo')
+                                        if app['rot_runtime']['rot_target'] is not None or state.get('rot_direction') not in ('---', None):
+                                            raise ValueError('RESET odbijen: rotor nije potvrden kao miran')
+                                        app['rot_runtime']['rot_fault'] = None
+                                        app['rot_runtime']['rot_stop_result'] = ''
+                                    else:
+                                        if app['rot_runtime']['rot_fault']:
+                                            raise ValueError('SAFETY LOCK: '+app['rot_runtime']['rot_fault']+'; prvo provjeri rotor pa RESET')
+                                        state = app['rot_state']
+                                        if not state.get('rot_connected') or state.get('rot_raw') is None:
+                                            raise ValueError('Nema valjanog ocitanja rotora')
+                                        # Ne dozvoli naredbu na temelju starog ocitanja.
+                                        if time.monotonic() - app['rot_runtime']['rot_last_read'] > 3:
+                                            raise ValueError('Ocitanje rotora je zastarjelo')
+                                        await asyncio.to_thread(app['rotor'].go, d.get('v'), state['rot_raw'])
+                                        app['rot_runtime']['rot_target'] = int(d['v'])
+                                        app['rot_runtime']['rot_go_at'] = time.monotonic()
+                                await ws.send_str(json.dumps({'rot_message': 'STOP poslan' if k=='rot_stop' else ('RESET prihvacen' if k=='rot_reset' else 'GO poslan')}))
+                            except Exception as exc:
+                                await ws.send_str(json.dumps({'rot_message': 'Greska: '+str(exc)}))
+                        elif k == 'ptt':
                             want = bool(d.get('v'))
                             if want and app['ptt_owner'] is None and radio.state.get('mode') in ('USB','LSB') and audio and audio.dev_out is not None:
                                 app['ptt_owner'] = ws
@@ -1253,6 +1738,16 @@ def make_app(radio, password, audio=None):
                         elif k == 'cw_stop':
                             app['ptt_owner'] = None
                             radio.apply(k, d.get('v'))
+                            for client in list(app['clients']):
+                                if not client.closed:
+                                    await client.send_str(json.dumps({'cw_monitor_stop': True}))
+                        elif k == 'cw':
+                            cwtext = str(d.get('v') or '').replace('(call)', radio.callsign or '')
+                            radio.apply(k, d.get('v'))
+                            event = json.dumps({'cw_monitor': {'text': cwtext, 'wpm': radio.state.get('cwspd') or 20}})
+                            for client in list(app['clients']):
+                                if not client.closed:
+                                    await client.send_str(event)
                         elif k and k not in ('ptt',):
                             radio.apply(k, d.get('v'))
                     elif m.type == web.WSMsgType.BINARY and audio and m.data[:1] == b'\x03' \
@@ -1288,6 +1783,113 @@ def make_app(radio, password, audio=None):
                     radio.apply('ptt', 0)
         app['tx_watchdog_task'] = asyncio.create_task(tx_watchdog())
 
+        async def rotor_poll():
+            # Aktivna aplikacijska zastita; ne zamjenjuje hardverske granicnike.
+            # RAW -180..180 ima dva razlicita mehanicka kraja.
+            previous_raw = None
+            previous_time = None
+            stable_count = 0
+            jump_count = 0
+            last_event = None
+            while True:
+                async with app['rot_lock']:
+                    state = await asyncio.to_thread(app['rotor'].read)
+                    now = time.monotonic()
+                    state['rot_target'] = app['rot_runtime']['rot_target']
+                    warnings = []
+                    if state['rot_connected']:
+                        raw = state['rot_raw']
+                        az = state['rot_az']
+                        if not -180 <= raw <= 180:
+                            warnings.append('RAW IZVAN GRANICA')
+                        if previous_raw is None or previous_time is None or now - previous_time > 5:
+                            state['rot_direction'] = 'NEPOZNAT'
+                            state['rot_motion'] = 'POCETNO OCITANJE'
+                            stable_count = 0
+                        else:
+                            delta = raw - previous_raw
+                            dt = max(0.001, now - previous_time)
+                            # Ne pretpostavljamo brzinu motora: veliki skok samo biljezimo.
+                            if abs(delta) > 45:
+                                # AlfaSpid poslije GO moze kratko vratiti zadani kut
+                                # umjesto stvarnog. Jedno takvo ocitanje nije dokaz
+                                # fizickog pomaka; trazimo 3 uzastopna odstupanja.
+                                jump_count += 1
+                                if jump_count >= 3:
+                                    warnings.append('TRAJAN SKOK RAW >45° (3 OCITANJA)')
+                                else:
+                                    warnings.append('PRIJELAZNO RAW OCITANJE (%d/3) - PROVJERA' % jump_count)
+                            else:
+                                jump_count = 0
+                            if abs(delta) < 0.5:
+                                stable_count += 1
+                                state['rot_direction'] = '---'
+                                state['rot_motion'] = 'MIRUJE / NEMA PROMJENE'
+                            else:
+                                stable_count = 0
+                                state['rot_direction'] = 'RASTE' if delta > 0 else 'PADA'
+                                state['rot_motion'] = 'KRECE SE (PROCJENA)'
+                        # Ne koristimo nevaljana ocitanja za sljedecu usporedbu.
+                        if -180 <= raw <= 180 and (previous_raw is None or abs(raw - previous_raw) <= 45):
+                            previous_raw, previous_time = raw, now
+                            app['rot_runtime']['rot_last_good'] = now
+                        elif not -180 <= raw <= 180:
+                            previous_raw = previous_time = None
+                        # Kod skoka zadrzi posljednji vjerodostojan RAW za usporedbu.
+                        app['rot_runtime']['rot_last_read'] = now
+                        if app['rot_runtime']['rot_target'] is not None:
+                            target = app['rot_runtime']['rot_target']
+                            # Razlika cilja i prikazanog azimuta, uz kruznu normalizaciju.
+                            error = abs((az - target + 180) % 360 - 180)
+                            if error <= 1 and stable_count >= 2 and jump_count == 0:
+                                state['rot_motion'] = 'TARGET REACHED'
+                                app['rot_runtime']['rot_target'] = None
+                                state['rot_target'] = None
+                    else:
+                        if app['rot_runtime']['rot_target'] is not None:
+                            warnings.append('GUBITAK COM6 VEZE TIJEKOM GO')
+                        previous_raw = previous_time = None
+                        jump_count = 0
+                        stable_count = 0
+                        state['rot_direction'] = '---'
+                        state['rot_motion'] = 'NEMA VEZE'
+                    # STOP se salje samo za anomaliju dok je GO aktivan.
+                    # Gubitak veze moze onemoguciti STOP: to nije potvrda zaustavljanja.
+                    critical = [w for w in warnings if not w.startswith('PRIJELAZNO RAW OCITANJE')]
+                    if critical and app['rot_runtime']['rot_target'] is not None and not app['rot_runtime']['rot_fault']:
+                        app['rot_runtime']['rot_fault'] = ' / '.join(critical)
+                        app['rot_runtime']['rot_target'] = None
+                        app['rot_runtime']['rot_go_at'] = None
+                        state['rot_target'] = None
+                        try:
+                            await asyncio.to_thread(app['rotor'].stop)
+                            app['rot_runtime']['rot_stop_result'] = 'STOP POSLAN (nije potvrdeno mirovanje)'
+                        except Exception as exc:
+                            app['rot_runtime']['rot_stop_result'] = 'STOP NIJE POTVRDEN: '+str(exc)[:90]
+                        print('[ROTOR SAFETY]', app['rot_runtime']['rot_fault'], '|', app['rot_runtime']['rot_stop_result'])
+                    state['rot_warning'] = ' / '.join(warnings)
+                    state['rot_fault'] = app['rot_runtime']['rot_fault']
+                    state['rot_stop_result'] = app['rot_runtime']['rot_stop_result']
+                    state['rot_monitor_mode'] = 'SAFETY LOCK' if app['rot_runtime']['rot_fault'] else 'ACTIVE MONITOR'
+                    if warnings:
+                        event = (tuple(warnings), state.get('rot_raw'))
+                        if event != last_event:
+                            line = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + ' | ' + state['rot_warning'] + ' | RAW=' + str(state.get('rot_raw'))
+                            app['rot_runtime']['rot_monitor_events'].append(line)
+                            app['rot_runtime']['rot_monitor_events'] = app['rot_runtime']['rot_monitor_events'][-50:]
+                            print('[ROTOR MONITOR]', line)
+                        last_event = event
+                    else:
+                        last_event = None
+                    app['rot_state'].clear()
+                    app['rot_state'].update(state)
+                for client in list(app['clients']):
+                    if not client.closed:
+                        try: await client.send_str(json.dumps(state))
+                        except Exception: pass
+                await asyncio.sleep(1.0 if state['rot_connected'] else 3.0)
+        app['rotor_task'] = asyncio.create_task(rotor_poll())
+
         async def bcast(d):
             for c in list(app['clients']):
                 try:
@@ -1295,6 +1897,7 @@ def make_app(radio, password, audio=None):
                 except Exception:
                     pass
         radio.on_change = lambda d: loop.call_soon_threadsafe(asyncio.ensure_future, bcast(d))
+        radio.on_cw_key = lambda down: loop.call_soon_threadsafe(asyncio.ensure_future, bcast({'cw_key': int(down)}))
 
         async def bcast_bin(b):
             for c in list(app['clients']):
@@ -1312,6 +1915,12 @@ def make_app(radio, password, audio=None):
 
     app.on_startup.append(on_start)
     async def on_cleanup(app):
+        rot_task = app.get('rotor_task')
+        if rot_task:
+            rot_task.cancel()
+            try: await rot_task
+            except asyncio.CancelledError: pass
+        app['rotor'].close()
         task = app.get('tx_watchdog_task')
         if task:
             task.cancel()
@@ -1324,6 +1933,7 @@ def make_app(radio, password, audio=None):
     app.router.add_get('/', index)
     app.router.add_get('/cw', cw_page)
     app.router.add_get('/api/ping', api_ping)
+    app.router.add_post('/api/pc/shutdown', api_pc_shutdown)
     app.router.add_get('/api/macros', api_macros_get)
     app.router.add_post('/api/macros', api_macros_post)
     app.router.add_get('/ws', ws_handler)
@@ -1343,7 +1953,7 @@ def make_app(radio, password, audio=None):
         mode = str(radio.state.get('mode') or '')
         if mode in ('USB', 'LSB'):
             mode = 'SSB'  # ADIF MODE: USB/LSB se zapisuju kao SSB
-        count = adif_append(call, rst, rstr, freq, mode, app['mycall'], app['grid'], name, qth)
+        count = adif_append(call, rst, rstr, freq, mode, app['macro_identity']['mycall'], app['macro_identity']['grid'], name, qth)
         return web.json_response({'ok': True, 'count': count})
 
     async def log_page(req):
