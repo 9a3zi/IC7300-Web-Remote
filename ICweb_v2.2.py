@@ -1,0 +1,2039 @@
+"""IC-7300 web kontrola: CI-V preko USB serijskog porta + web sucelje (aiohttp/WebSocket).
++ waterfall (scope) i audio RX u browseru.
++ DODANO: filteri FIL1/2/3, 8 CW makronaredbi, prekid CW predaje, direktni unos CW teksta.
+  Web sucelje za nove funkcije je na adresi  /cw  (index.html ostaje netaknut).
+
+Pokretanje:  python server.py --port COM3 --password tvojalozinka --audio-out "USB Audio CODEC"
+Potrebno:    pip install pyserial aiohttp numpy sounddevice
+
+WebSocket protokol (binarne poruke, prvi bajt = tip):
+  0x01 + 8 bajtova (2x uint32 BE: f_low, f_high u Hz) + N bajtova piksela (0-160)  -> waterfall red
+  0x02 + N bajtova u-law audio (8 kHz, mono)                                       -> zvuk u browseru
+  0x03 + N bajtova u-law audio (klijent -> radio, samo dok je PTT aktivan)         -> TX
+
+Nove WS naredbe (tekst JSON {"k":..., "v":...}):
+  {"k":"filter","v":1|2|3}   postavi FIL1/2/3 za trenutni mod (06h + filter bajt)
+  {"k":"cw","v":"<tekst>"}   predaja CW teksta (17h, do 30 znakova po okviru);
+                             ako nije CW mod, automatski prebaci na CW
+  {"k":"cw_stop"}            prekini CW makro predaju (17h 00h) + vrati u RX (1Ch 00h 00h)
+Makronaredbe: GET/POST /api/macros (sprema se u ic7300_macros.json pored skripte)
+"""
+import argparse, asyncio, base64, json, threading, time
+import datetime
+from pathlib import Path
+import serial, struct, ssl, re, os, tempfile, shutil, secrets, hmac, subprocess
+from aiohttp import web
+try:
+    import numpy as np
+    import sounddevice as sd
+except ImportError:          # audio je opcionalan
+    np = sd = None
+
+VERSION = 'v2.1 (CW makronaredbe + filteri + /cw konzola)'
+
+CTRL = 0xE0
+MODES = {0: 'LSB', 1: 'USB', 2: 'AM', 3: 'CW', 4: 'RTTY', 5: 'FM', 7: 'CW-R', 8: 'RTTY-R'}
+MODE_ID = {v: k for k, v in MODES.items()}
+LEVELS = {'af': 0x01, 'rf': 0x02, 'sql': 0x03, 'power': 0x0A, 'cwspd': 0x0C}   # cmd 14 xx
+FLAGS = {'nb': 0x22, 'nr': 0x40, 'anf': 0x41}                    # cmd 16 xx, 0/1
+METERS = {0x02: 'smeter', 0x11: 'pwr_meter', 0x12: 'swr'}        # cmd 15 xx
+
+# Poseban kljuc za gasenje PC-a. Nije dostupan preko web servera.
+SHUTDOWN_KEY_PATH = Path(__file__).with_name('icweb_shutdown_key.txt')
+
+def load_shutdown_key():
+    if SHUTDOWN_KEY_PATH.exists():
+        key = SHUTDOWN_KEY_PATH.read_text(encoding='utf-8').strip()
+        if len(key) < 5:
+            raise RuntimeError('icweb_shutdown_key.txt mora sadrzavati kljuc od barem 24 znaka')
+        return key
+    key = secrets.token_urlsafe(4)
+    # Ekskluzivno kreiranje: nikad ne pregazi postojeci kljuc.
+    try:
+        with SHUTDOWN_KEY_PATH.open('x', encoding='utf-8') as f:
+            f.write(key + '\n')
+    except FileExistsError:
+        return load_shutdown_key()
+    print('[ICWEB] Kljuc za SHUTDOWN PC spremljen u:', SHUTDOWN_KEY_PATH)
+    return key
+
+MACRO_PATH = Path(__file__).with_name('ic7300_macros.json')
+ADIF_PATH = Path(__file__).with_name('ic7300_log.adi')
+
+BANDS = [(1840000, '160M'), (3570000, '80M'), (5351500, '60M'), (7100000, '40M'),
+         (10100000, '30M'), (14000000, '20M'), (18100000, '17M'), (21000000, '15M'),
+         (24900000, '12M'), (28000000, '10M'), (50000000, '6M'), (70000000, '4M')]
+
+
+def adif_band(freq):
+    for f, b in reversed(BANDS):
+        if freq >= f:
+            return b
+    return ''
+
+
+def adif_record(call, rst, rstr, freq, mode, mycall='', grid='', name='', qth=''):
+    now = datetime.datetime.utcnow()
+    fields = [('call', call), ('mode', mode),
+              ('rst_sent', rst), ('rst_rcvd', rstr), ('name', name), ('qth', qth),
+              ('qso_date', now.strftime('%Y%m%d')), ('time_on', now.strftime('%H%M%S')),
+              ('band', adif_band(freq).lower()), ('freq', '%.6f' % (freq / 1e6)),
+              ('station_callsign', mycall), ('my_gridsquare', grid)]
+    return ''.join('<%s:%d>%s ' % (k.upper(), len(v.encode('utf-8')), v) for k, v in fields if v) + '<EOR>\n'
+
+
+def adif_append(call, rst, rstr, freq, mode, mycall='', grid='', name='', qth=''):
+    with ADIF_LOCK:
+        return _adif_append_unlocked(call, rst, rstr, freq, mode, mycall, grid, name, qth)
+
+def _adif_append_unlocked(call, rst, rstr, freq, mode, mycall='', grid='', name='', qth=''):
+    """Dopise QSO u ADIF log; vraca ukupan broj zapisa."""
+    rec = adif_record(call, rst, rstr, freq, mode, mycall, grid, name, qth)
+    fresh = not ADIF_PATH.exists()
+    with open(ADIF_PATH, 'a', encoding='utf-8') as f:
+        if fresh:
+            f.write('ADIF export from IC-7300 Web Remote\n'
+                    '<ADIF_VER:5>3.1.4\n<PROGRAMID:10>IC7300WEB\n<EOH>\n\n')
+        f.write(rec)
+    n = 0
+    try:
+        n = sum(1 for line in open(ADIF_PATH, encoding='utf-8') if '<eor>' in line.lower())
+    except Exception:
+        pass
+    return n
+
+
+# ADIF parser radi s bajtovima: ADIF duljine su UTF-8 bajtovi, ne znakovi.
+ADIF_LOCK = threading.RLock()
+EDIT_FIELDS = ('CALL','RST_SENT','RST_RCVD','NAME','QTH','QSO_DATE','TIME_ON','FREQ','BAND','MODE')
+
+def adif_parse(raw):
+    tags = []
+    pos = 0
+    pattern = re.compile(rb'<([A-Za-z_][A-Za-z_0-9]*)(?::([0-9]+)(?::[^>]*)?)?>', re.I)
+    while pos < len(raw):
+        m = pattern.search(raw, pos)
+        if not m:
+            break
+        tag = m.group(1).decode('ascii').upper()
+        if tag in ('EOR','EOH'):
+            tags.append((tag, b''))
+            pos = m.end()
+            continue
+        if m.group(2) is None:
+            pos = m.end()
+            continue
+        size = int(m.group(2))
+        if size > 1000000 or m.end()+size > len(raw):
+            raise ValueError('Neispravna ADIF duljina polja')
+        tags.append((tag, raw[m.end():m.end()+size]))
+        pos = m.end()+size
+    return tags
+
+def adif_load():
+    if not ADIF_PATH.exists():
+        return [], []
+    raw = ADIF_PATH.read_bytes()
+    if not raw.strip():
+        return [], []
+    header, records, current = [], [], []
+    for tag, value in adif_parse(raw):
+        if tag == 'EOH':
+            header = current
+            current = []
+        elif tag == 'EOR':
+            records.append(current)
+            current = []
+        else:
+            current.append((tag, value))
+    if current:
+        raise ValueError('ADIF sadrži nedovršen zapis')
+    return header, records
+
+def adif_field(record, tag):
+    return next((v.decode('utf-8', 'replace') for k,v in record if k == tag), '')
+
+def adif_serialize(header, records):
+    def encode_fields(fields):
+        return b' '.join(b'<'+k.encode('ascii')+b':'+str(len(v)).encode('ascii')+b'>'+v for k,v in fields)
+    if header:
+        out = b'ADIF export from IC-7300 Web Remote\n'+encode_fields(header)+b'\n<EOH>\n\n'
+    else:
+        out = b'ADIF export from IC-7300 Web Remote\n<ADIF_VER:5>3.1.4\n<PROGRAMID:10>IC7300WEB\n<EOH>\n\n'
+    for rec in records:
+        out += encode_fields(rec)+b' <EOR>\n'
+    return out
+
+def adif_update(index, changes):
+    with ADIF_LOCK:
+        header, records = adif_load()
+        if not (0 <= index < len(records)):
+            raise ValueError('Veza nije pronađena')
+        rec = records[index]
+        for tag, value in changes.items():
+            if tag not in EDIT_FIELDS:
+                continue
+            val = str(value).strip()
+            if tag == 'CALL':
+                val = val.upper()
+                if not val or len(val) > 10:
+                    raise ValueError('Callsign mora imati 1–10 znakova')
+            if tag in ('RST_SENT','RST_RCVD') and len(val) > 3:
+                raise ValueError('RST ima najviše 3 znaka')
+            if tag == 'NAME' and len(val) > 10 or tag == 'QTH' and len(val) > 15:
+                raise ValueError('Predugačko polje Name/QTH')
+            if tag == 'QSO_DATE' and not re.fullmatch(r'\d{8}', val):
+                raise ValueError('Date must be YYYYMMDD')
+            if tag == 'TIME_ON' and not re.fullmatch(r'\d{4}(?:\d{2})?', val):
+                raise ValueError('Vrijeme mora biti HHMM ili HHMMSS')
+            if tag == 'FREQ':
+                try:
+                    if not (0 < float(val) < 1000): raise ValueError()
+                except ValueError: raise ValueError('Frekvencija mora biti u MHz')
+            rec = [(k,v) for k,v in rec if k != tag]
+            if val:
+                rec.append((tag, val.encode('utf-8')))
+        records[index] = rec
+        # Sačuvaj originalni log prije zamjene, a novu verziju zapiši atomarno.
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=str(ADIF_PATH.parent), delete=False) as f:
+                tmp = Path(f.name)
+                f.write(adif_serialize(header, records))
+                f.flush()
+                os.fsync(f.fileno())
+            shutil.copy2(ADIF_PATH, ADIF_PATH.with_suffix('.adi.bak'))
+            os.replace(tmp, ADIF_PATH)
+        finally:
+            if tmp and tmp.exists(): tmp.unlink()
+
+
+def adif_delete(index):
+    """Obriši jedan QSO uz backup i atomarnu zamjenu ADIF datoteke."""
+    with ADIF_LOCK:
+        header, records = adif_load()
+        if not (0 <= index < len(records)):
+            raise ValueError('Veza nije pronađena')
+        del records[index]
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=str(ADIF_PATH.parent), delete=False) as f:
+                tmp = Path(f.name)
+                f.write(adif_serialize(header, records))
+                f.flush()
+                os.fsync(f.fileno())
+            shutil.copy2(ADIF_PATH, ADIF_PATH.with_suffix('.adi.bak'))
+            os.replace(tmp, ADIF_PATH)
+        finally:
+            if tmp and tmp.exists():
+                tmp.unlink()
+
+
+def norm8(m, limit=1000, count=15):
+    """Normaliziraj listu na tocno count stringova (makro M1..)."""
+    m = [str(x)[:limit] for x in m][:count]
+    return m + [''] * (count - len(m))
+
+
+def norm_names(n, count=15):
+    """Imena makroa: do 8 znakova; po defaultu M1..M(count)."""
+    n = [str(x)[:8] for x in n][:count]
+    return n + ['M%d' % (i + 1) for i in range(len(n), count)]
+
+
+def load_macros():
+    """Vraca (tekstovi, imena) - staru datoteku prihvaca."""
+    try:
+        d = json.loads(MACRO_PATH.read_text(encoding='utf-8'))
+        return norm8(d.get('macros', []), count=15), \
+            norm_names(d.get('names', []), count=15), \
+            str(d.get('mycall', ''))[:12], str(d.get('gridsquare', ''))[:8]
+    except Exception:
+        return [''] * 15, norm_names([], count=15), '', ''
+
+
+def save_macros(m, n=None, mycall='', grid=''):
+    """Atomski spremi svih 15 CW makroa; greške se prosljeđuju API-ju."""
+    data = {'macros': norm8(m, count=15),
+            'names': norm_names(n or [], count=15),
+            'mycall': str(mycall)[:12], 'gridsquare': str(grid)[:8]}
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                         dir=MACRO_PATH.parent, prefix='.cw_macros_',
+                                         suffix='.tmp', delete=False) as f:
+            temp = Path(f.name)
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, MACRO_PATH)
+    finally:
+        if temp is not None and temp.exists():
+            temp.unlink()
+    return data
+
+
+def bcd_freq(f):
+    s = f"{int(f):010d}"
+    return bytes(int(s[i:i + 2], 16) for i in (8, 6, 4, 2, 0))
+
+
+def parse_freq(b):
+    return int(''.join(f"{x:02X}" for x in reversed(b)))
+
+
+def bcd_lvl(v):
+    s = f"{max(0, min(255, int(v))):04d}"
+    return bytes([int(s[:2], 16), int(s[2:], 16)])
+
+
+def parse_lvl(b):
+    return int(f"{b[0]:02X}{b[1]:02X}")
+
+
+class Radio:
+    MORSE = {'A': '.-', 'B': '-...', 'C': '-.-.', 'D': '-..', 'E': '.', 'F': '..-.',
+             'G': '--.', 'H': '....', 'I': '..', 'J': '.---', 'K': '-.-', 'L': '.-..',
+             'M': '--', 'N': '-.', 'O': '---', 'P': '.--.', 'Q': '--.-', 'R': '.-.',
+             'S': '...', 'T': '-', 'U': '..-', 'V': '...-', 'W': '.--', 'X': '-..-',
+             'Y': '-.--', 'Z': '--..', '0': '-----', '1': '.----', '2': '..---',
+             '3': '...--', '4': '....-', '5': '.....', '6': '-....', '7': '--...',
+             '8': '---..', '9': '----.', '.': '.-.-.-', ',': '--..--', '?': '..--..',
+             '/': '-..-.', '=': '-...-', '+': '.-.'}
+
+    def __init__(self, port, baud, addr, keyline='RTS'):
+        self.port = port
+        self.baud = baud
+        self.addr = addr
+        # Na IC-7300u se preko DTR/RTS moze raditi USB SEND / USB Keying(CW).
+        # Ako su linije aktivne pri otvaranju, u CW modu radio odmah prelazi u TX.
+        self.ser = None
+        self._open_port()
+        self.key_line = keyline        # 'RTS' ili 'DTR' - mora odgovarati postavci
+                                       # USB Keying (CW) u radiju
+        self._key_down = False
+        self.cw_mode = 'buf'           # CI-V 17h, bez potrebe za RTS
+        self.state = {}
+        self.lock = threading.Lock()
+        self.on_change = lambda d: None
+        self.on_cw_key = lambda down: None
+        self.on_scope = lambda b: None
+        self.sc = None
+        self.scbuf = bytearray()
+        self._reading_b = False     # sljedeci direktni 03 odgovor = TX (sub VFO B)
+        self._direct = False        # je li okvir direktan odgovor (E0) ili broadcast (00)
+        self._want_txfreq = False   # treba procitati TX (sub VFO B) - samo na dogadjaj
+        self._cw_cancel = False     # prekid CW predaje (makro/direktni tekst)
+        self._cw_wait_ack = False   # cekamo FB/NG potvrdu za 17h komad
+        self._cw_ack = None         # 'ok' / 'ng' zadnja potvrda
+        self._last_scope = 0.0      # vrijeme zadnjeg scope (27 00) okvira
+        self.callsign = ''          # pozivni znak za zamjenu (call) u makroima
+
+    def _open_port(self):
+        """Otvori serijski port (tolerira ako radio nije spreman) i odmah
+        ugasi DTR/RTS (sprijecava trenutni TX pri bootu zbog USB Keyinga)."""
+        try:
+            self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+        except Exception:
+            self.ser = None
+            return False
+        try:
+            self.ser.setDTR(False)
+            self.ser.setRTS(False)
+        except Exception:
+            pass
+        return True
+
+    def _drop_port(self):
+        try:
+            if self.ser:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+
+    def send(self, cmd, data=b''):
+        if not self.ser:
+            return
+        with self.lock:
+            try:
+                self.ser.write(bytes([0xFE, 0xFE, self.addr, CTRL]) + cmd + data + b'\xFD')
+            except Exception:
+                self._drop_port()
+
+    def set(self, k, v):
+        if self.state.get(k) != v:
+            self.state[k] = v
+            self.on_change({k: v})
+
+    def key(self, down):
+        """Spusta/podize key liniju (USB Keying CW)."""
+        down = bool(down)
+        if down == self._key_down:
+            return
+        self._key_down = down
+        if not self.ser:
+            return
+        if self.key_line == 'DTR':
+            self.ser.setDTR(down)
+        else:
+            self.ser.setRTS(down)
+        self.on_cw_key(down)
+
+    def _precise_sleep(self, t):
+        """Kratko spavanje s ms preciznoscu (hybrid: sleep + busy-wait)."""
+        if t <= 0:
+            return
+        if t > 0.01:
+            time.sleep(t - 0.004)
+        end = time.perf_counter() + min(t, 0.01)
+        while time.perf_counter() < end:
+            pass
+
+    def cw_key_send(self, text):
+        """Predaja CW titranjem key linije (USB Keying CW) - bez buffera,
+        prekidivo u bilo kojem trenutku, ravnomjerno na svim brzinama.
+        U radiju: USB SEND = OFF, USB Keying (CW) = linija kao --keyline."""
+        text = str(text).replace('(call)', self.callsign or '')
+        data = ''.join(ch for ch in text.upper()
+                       if ch in self.MORSE or ch == ' ')
+        if not data.strip():
+            return
+        self._cw_cancel = False
+
+        def worker():
+            try:
+                if self.state.get('mode') not in ('CW', 'CW-R'):
+                    self.send(b'\x06', bytes([MODE_ID['CW'], self.state.get('filt', 1)]))
+                    self.set('mode', 'CW')
+                    time.sleep(0.1)
+                word_gap = False
+                for ch in data:
+                    if self._cw_cancel:
+                        break
+                    if ch == ' ':
+                        word_gap = True
+                        continue
+                    if word_gap:
+                        u = 1.2 / max(5, self.state.get('cwspd') or 20)
+                        self._precise_sleep(4 * u)     # dovrsetak word gapa (7u)
+                        word_gap = False
+                        if self._cw_cancel:
+                            break
+                    u = 1.2 / max(5, self.state.get('cwspd') or 20)
+                    for i, el in enumerate(self.MORSE[ch]):
+                        if self._cw_cancel:
+                            break
+                        self.key(True)
+                        self._precise_sleep(u if el == '.' else 3 * u)
+                        self.key(False)
+                        if i < len(self.MORSE[ch]) - 1:
+                            self._precise_sleep(u)     # unutar znaka
+                    if self._cw_cancel:
+                        break
+                    self._precise_sleep(2 * u)         # razmak izmedu znakova
+            finally:
+                self.key(False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def cw_send(self, text):
+        """Predaja CW teksta (17h, do 30 znakova po okviru). Ako nije CW mod,
+        prebaci na CW (uz BK-IN u radiju radio odmah predaje). Buffer radija prima
+        ogranicen broj znakova (~60), pa se svaki komad POTVRDUJE: NG odgovor =
+        pun buffer -> komad se ponavlja nakon pauze. Prije sljedeceg komada ceka
+        ~90% njegovog trajanja (racunato po brzini kljuca i razmacima), tako da
+        buffer drži malo zalihe i u eteru NEMA pauza.
+        Radi u pozadinskoj niti."""
+        if self.cw_mode == 'key':
+            self.cw_key_send(text)
+            return
+        text = str(text).replace('(call)', self.callsign or '')
+        data = bytes(ord(ch) for ch in text if 0x20 <= ord(ch) <= 0x7E)
+        if not data:
+            return
+        self._cw_cancel = False
+
+        def worker():
+            if self.state.get('mode') not in ('CW', 'CW-R'):
+                self.send(b'\x06', bytes([MODE_ID['CW'], self.state.get('filt', 1)]))
+                self.set('mode', 'CW')
+                time.sleep(0.1)
+            wpm = self.state.get('cwspd') or 20
+            for i in range(0, len(data), 30):
+                if self._cw_cancel:
+                    break
+                chunk = data[i:i + 30]
+                while not self._cw_cancel:          # dok radio ne potvrdi (FB)
+                    self._cw_ack = None
+                    self._cw_wait_ack = True
+                    self.send(b'\x17', chunk)
+                    t0 = time.time()
+                    while self._cw_ack is None and time.time() - t0 < 2.0:
+                        time.sleep(0.02)
+                    if self._cw_ack != 'ng':
+                        break                       # 'ok' (ili nema odgovora) -> dalje
+                    time.sleep(1.5)                 # pun buffer: pricekaj pa ponovi
+                if self._cw_cancel:
+                    break
+                # Sljedeci komad saljemo kad je ~polovica prethodnog odigrana
+                # (50% procjene: 6 jedinica/znak + 4/razmak). Buffer drži zalihu,
+                # pa nikad ne prazni -> nema pauza ni ispadanja BKIN-a. Ako bi
+                # pretjerali, radio odgovori NG i komad se ponovi (bez gubitka).
+                time.sleep((6 * len(chunk) + 4 * chunk.count(b' ')) * 1.2
+                           / max(5, wpm) * 0.5)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def cw_stop(self):
+        """Prekini CW predaju odmah: pusti key liniju, zaustavi nit, isprazni
+        CW buffer radija (17h 00h) i vrati u RX (1Ch 00h 00h)."""
+        self._cw_cancel = True
+        try:
+            self.key(False)
+        except Exception:
+            pass
+        # 17 FF = zaustavlja slanje CW poruke (sluzbeni Icom kod! 17 00 ne radi)
+        self.send(b'\x17', b'\xFF')
+        self.send(b'\x1C\x00', b'\x00')   # odmah u RX
+        self.set('ptt', 0)
+
+    def reader(self):
+        buf = bytearray()
+        while True:
+            try:
+                if not self.ser:
+                    # radio nedostupan (ugasen/resetiran) - pokusaj ponovno
+                    if self._open_port():
+                        print('** Serijski port otvoren:', self.port, '- ponovno očitavanje')
+                        self.scope_init()
+                        self.read_initial_state()
+                    else:
+                        print('!! Nema veze s radio-stanicom na', self.port,
+                              '- pokusavam svake 2 s')
+                    time.sleep(2.0)
+                    continue
+                buf += self.ser.read(64)
+                while 0xFD in buf:
+                    end = buf.index(0xFD)
+                    frame = bytes(buf[:end]); del buf[:end + 1]
+                    i = frame.find(b'\xFE\xFE')
+                    if i < 0:
+                        continue
+                    f = frame[i + 2:]
+                    # odgovor radija: to=E0 (ili 00 za transceive), from=addr
+                    if len(f) >= 3 and f[1] == self.addr and f[0] in (CTRL, 0x00):
+                        self._direct = (f[0] == CTRL)
+                        try:
+                            self.parse(f[2:])
+                        except Exception as e:
+                            print('parse err', e, f.hex())
+            except Exception:
+                # port je pao usred rada (npr. radio se restartao) - reconnect
+                self._drop_port()
+                time.sleep(2.0)
+
+    def parse(self, p):
+        c = p[0]
+        if c in (0x00, 0x03) and len(p) >= 6:
+            f = parse_freq(p[1:6])
+            if c == 0x03 and self._reading_b and self._direct:
+                self._reading_b = False
+                self.set('txfreq', f)           # sub VFO (B) = TX u split modu
+            else:
+                self.set('freq', f)             # main VFO = RX
+        elif c in (0x01, 0x04) and len(p) >= 2:
+            self.set('mode', MODES.get(p[1], '?'))
+            if len(p) >= 3:
+                self.set('filt', p[2])          # filter bajt uz mod (FIL1/2/3 = 1/2/3)
+        elif c == 0x0F and len(p) >= 2:
+            self.set('split', int(p[1] == 1))
+        elif c == 0x11 and len(p) >= 2:
+            self.set('att', int(p[1] == 0x20))
+        elif c == 0x14 and len(p) >= 4:
+            for k, sub in LEVELS.items():
+                if p[1] == sub:
+                    if sub == 0x0C:   # key speed: 0000=6WPM ... 0255=48WPM
+                        self.set(k, round(6 + parse_lvl(p[2:4]) * 42 / 255))
+                    else:
+                        self.set(k, parse_lvl(p[2:4]))
+        elif c == 0x15 and len(p) >= 4 and p[1] in METERS:
+            self.set(METERS[p[1]], parse_lvl(p[2:4]))
+        elif c == 0x16 and len(p) >= 3:
+            if p[1] == 0x02:
+                self.set('preamp', p[2])
+            for k, sub in FLAGS.items():
+                if p[1] == sub:
+                    self.set(k, p[2])
+        elif c == 0x27 and len(p) >= 5 and p[1] == 0x00:      # scope (waterfall) podaci
+            self._last_scope = time.time()
+            seq, mx = int(f"{p[3]:02X}"), int(f"{p[4]:02X}")
+            d = p[5:]
+            if seq == 1 and len(d) >= 11:
+                a, b = parse_freq(d[1:6]), parse_freq(d[6:11])
+                self.sc = (max(0, a - b), a + b) if d[0] == 0 else (a, b)   # 0 = center mode
+                self.scbuf = bytearray()
+            elif seq > 1 and self.sc:
+                self.scbuf += d
+                if seq == mx:
+                    # 0x01 = tip poruke "waterfall", zatim granice spektra, pa pikseli
+                    self.on_scope(b'\x01' + struct.pack('>II', *self.sc) + bytes(self.scbuf))
+        elif c == 0x1C and len(p) >= 3:
+            if p[1] == 0x00:
+                self.set('ptt', p[2])
+            elif p[1] == 0x01:
+                self.set('tuner', p[2])
+        elif c in (0xFB, 0xFA):              # OK / NG potvrda naredbe
+            if self._cw_wait_ack:
+                self._cw_ack = 'ok' if c == 0xFB else 'ng'
+                self._cw_wait_ack = False
+
+    def apply(self, k, v):
+        if k == 'freq':
+            self.send(b'\x05', bcd_freq(v)); self.set('freq', int(v))
+        elif k == 'mode' and v in MODE_ID:
+            self.send(b'\x06', bytes([MODE_ID[v], 1])); self.set('mode', v)
+        elif k == 'filter':                                   # FIL1/2/3 za trenutni mod
+            m = MODE_ID.get(self.state.get('mode'))
+            if m is not None:
+                f = max(1, min(3, int(v)))
+                self.send(b'\x06', bytes([m, f])); self.set('filt', f)
+        elif k == 'vfo':
+            self.send(b'\x07', {'A': b'\x00', 'B': b'\x01', 'X': b'\xB0', 'EQ': b'\xA0'}[v])
+            self.send(b'\x03')
+        elif k == 'cwspd':
+            # IC-7300 CI-V: 14 0C -> 0000=6 WPM ... 0255=48 WPM (linearno!)
+            wpm = max(6, min(48, int(v)))
+            raw = int(round((wpm - 6) * 255 / 42))
+            self.send(b'\x14\x0C', bcd_lvl(raw)); self.set('cwspd', wpm)
+        elif k in LEVELS:
+            self.send(b'\x14' + bytes([LEVELS[k]]), bcd_lvl(v)); self.set(k, int(v))
+        elif k in FLAGS:
+            self.send(b'\x16' + bytes([FLAGS[k]]), bytes([int(bool(v))])); self.set(k, int(bool(v)))
+        elif k == 'preamp':
+            self.send(b'\x16\x02', bytes([int(v)])); self.set('preamp', int(v))
+        elif k == 'att':
+            self.send(b'\x11', b'\x20' if v else b'\x00'); self.set('att', int(bool(v)))
+        elif k == 'split':
+            self.send(b'\x0F', bytes([int(bool(v))])); self.set('split', int(bool(v)))
+        elif k == 'ptt':
+            self.send(b'\x1C\x00', bytes([int(bool(v))])); self.set('ptt', int(bool(v)))
+        elif k == 'span':
+            self.send(b'\x27\x15\x00', bcd_freq(v))
+        elif k == 'tuner':
+            self.send(b'\x1C\x01', bytes([int(v)]))
+        elif k == 'powerbtn':
+            # 18 01 = power ON (radi samo iz standbyja, tj. ako je radio
+            # iskljucen preko softvera), 18 00 = power OFF
+            self.send(b'\x18', b'\x01' if v else b'\x00')
+            if v:
+                def _reinit():
+                    time.sleep(4.0)     # pricekaj boot radija
+                    self.scope_init()
+                    time.sleep(6.0)     # i ponovno za svaki slucaj
+                    self.scope_init()
+                threading.Thread(target=_reinit, daemon=True).start()
+        elif k == 'cw':
+            self.cw_send(str(v))                              # predaja CW teksta / makroa
+        elif k == 'cw_stop':
+            self.cw_stop()                                    # prekini makro predaju
+        elif k == 'txfreq':
+            self._want_txfreq = True                          # rucno osvjezi TX prikaz
+
+    def scope_init(self):
+        """Samo uključi CI-V izlaz scope podataka; ne mijenjaj LCD/SCOPE način."""
+        self.send(b'\x27\x11\x01')
+        self._last_scope = time.time()
+
+    def read_initial_state(self):
+        """Očitaj postavke radija bez mijenjanja njihovih vrijednosti."""
+        commands = [b'\x03', b'\x04', b'\x0F', b'\x11',
+                    b'\x1C\x00', b'\x1C\x01', b'\x15\x02']
+        commands += [b'\x14' + bytes([sub]) for sub in LEVELS.values()]
+        commands += [b'\x16' + bytes([sub]) for sub in (0x02, 0x22, 0x40, 0x41)]
+        for cmd in commands:
+            if not self.ser:
+                break
+            self.send(cmd)
+            time.sleep(0.06)
+
+    def poll(self):
+        n = 0
+        self.scope_init()
+        self.read_initial_state()
+        prev_split = prev_ptt = 0
+        while True:
+            split = 1 if self.state.get('split') else 0
+            ptt = 1 if self.state.get('ptt') else 0
+            if split and not prev_split:
+                self._want_txfreq = True          # split upravo ukljucen
+            if split and prev_ptt and not ptt:
+                self._want_txfreq = True          # upravo zavrsio prijenos
+            prev_split, prev_ptt = split, ptt
+
+            if self._want_txfreq and split and not ptt:
+                # TX = sub VFO (B). "Ples" VFO-om: odaberi B, procitaj, vrati na A.
+                # Radi se SAMO na dogadjaj (ukljucen split / kraj TX / klik), pa se
+                # prijem NE PREBACUJE s A - slusamo neprekidno na VFO A.
+                self._want_txfreq = False
+                self._reading_b = True
+                self.send(b'\x07\x01'); time.sleep(0.05)
+                self.send(b'\x03');    time.sleep(0.15)
+                self.send(b'\x07\x00'); time.sleep(0.05)
+                self.send(b'\x03')
+            else:
+                self.send(b'\x03')
+            self.send(b'\x04'); self.send(b'\x15\x02')
+            if self.ser and time.time() - self._last_scope > 8:   # scope stao? (power ciklus)
+                self.scope_init()
+            if self.state.get('ptt'):
+                self.send(b'\x15\x11'); self.send(b'\x15\x12')
+            elif self.state.get('pwr_meter') or self.state.get('swr'):
+                self.set('pwr_meter', 0)   # reset u RX - ne ostaju zaleđene
+                self.set('swr', 0)         # vrijednosti sa zadnjeg TX
+            if n % 8 == 0:
+                # Čitaj i aktivni filter: promjena na LCD-u mora se vidjeti na webu.
+                self.send(b'\x04')
+                for sub in LEVELS.values():
+                    self.send(b'\x14' + bytes([sub]))
+                for sub in (0x02, 0x22, 0x40, 0x41):
+                    self.send(b'\x16' + bytes([sub]))
+                for q in (b'\x11', b'\x0F', b'\x1C\x00', b'\x1C\x01'):
+                    self.send(q)
+            n += 1
+            time.sleep(0.25)
+
+
+def ulaw_enc(x):
+    x = np.clip(x, -1, 1)
+    y = np.sign(x) * np.log1p(255 * np.abs(x)) / np.log(256)
+    return ((y + 1) / 2 * 255 + 0.5).astype(np.uint8)
+
+
+def ulaw_dec(b):
+    y = b.astype(np.float32) / 255 * 2 - 1
+    return (np.sign(y) * (256 ** np.abs(y) - 1) / 255).astype(np.float32)
+
+
+class Audio:
+    """RX: USB codec -> 8 kHz u-law -> web. TX: web -> 8 kHz u-law -> USB codec."""
+    def __init__(self, dev_in, dev_out, rate=8000, gain=3.0):
+        self.dev_in, self.dev_out, self.k = dev_in, dev_out, 48000 // rate
+        self.gain = float(gain)      # RX pojacanje prije slanja u browser (1 = bez)
+        self.txbuf = np.zeros(0, np.float32)
+        self.lock = threading.Lock()
+        self.emit = lambda b: None
+
+    def start(self, emit):
+        self.emit = emit
+        if self.dev_in is not None:
+            self.inp = sd.InputStream(device=self.dev_in, samplerate=48000, channels=1,
+                                      blocksize=1920, dtype='float32', callback=self.on_in)
+            self.inp.start()
+        if self.dev_out is not None:
+            self.out = sd.OutputStream(device=self.dev_out, samplerate=48000, channels=1,
+                                       blocksize=960, dtype='float32', callback=self.on_out)
+            self.out.start()
+
+    def on_in(self, data, frames, t, status):
+        x = data[:, 0]
+        # jednostavno decimiranje 48k -> 8k (prosjek grupa od 6 uzoraka)
+        x = x[:len(x) // self.k * self.k].reshape(-1, self.k).mean(axis=1)
+        self.emit(b'\x02' + ulaw_enc(x * self.gain).tobytes())
+
+    def on_out(self, out, frames, t, status):
+        with self.lock:
+            n = min(frames, len(self.txbuf))
+            out[:n, 0] = self.txbuf[:n]
+            self.txbuf = self.txbuf[n:]
+        out[n:] = 0
+
+    def play(self, b):
+        x = ulaw_dec(np.frombuffer(b, np.uint8))
+        up = np.interp(np.arange(len(x) * self.k) / self.k, np.arange(len(x)), x).astype(np.float32)
+        with self.lock:
+            self.txbuf = np.concatenate([self.txbuf, up])[-24000:]
+
+
+LOG_PAGE = '''<!doctype html><html lang="hr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IC-7300 · QSO LOG</title>\n<style>:root{color-scheme:dark}*{box-sizing:border-box}body{font:14px system-ui,Arial;background:#10141a;color:#e6edf3;margin:0;padding:20px}.top{display:flex;gap:15px;align-items:center;flex-wrap:wrap;margin-bottom:18px}h2{margin:0;color:#f5a524}.panel{background:#1a212b;padding:16px;border-radius:12px}input{background:#10141a;border:1px solid #425064;border-radius:5px;color:#e6edf3;padding:7px;font:inherit}#search{min-width:240px}button{background:#2d5279;color:white;border:0;border-radius:6px;padding:8px 12px;cursor:pointer}button:hover{background:#386b9d}.tablewrap{overflow:auto;max-height:75vh}table{border-collapse:collapse;width:100%;white-space:nowrap}th{position:sticky;top:0;background:#273446;color:#f5a524;text-align:left;z-index:1}td,th{padding:9px 11px;border-bottom:1px solid #354050}tr:nth-child(even){background:#202b37}tr:hover{background:#304053}.edit{background:#b8791c;color:#fff}.delete{background:#9b3038;margin-left:8px}.delete:hover{background:#bb3c46}.modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;padding:16px}.dialog{background:#202b37;border:1px solid #516070;border-radius:12px;padding:22px;max-width:650px;width:100%;max-height:90vh;overflow:auto}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:18px 0}.fields label{display:flex;flex-direction:column;gap:5px;color:#b8c8d9}.fields input{width:100%}.actions{display:flex;justify-content:flex-end;gap:10px}#status{color:#8ccda1}</style></head><body>\n<div class="panel"><div class="top"><h2>IC-7300 · QSO LOG</h2><input id="search" placeholder="Search callsign, name, QTH…" oninput="render()"><button onclick="load()">Refresh</button><span id="count"></span><span id="status"></span></div><div class="tablewrap"><table><thead><tr><th>#</th><th>Date</th><th>UTC</th><th>Callsign</th><th>Band</th><th>MHz</th><th>Mode</th><th>RSTs</th><th>RSTr</th><th>Name</th><th>QTH</th><th></th></tr></thead><tbody id="rows"></tbody></table></div></div>\n<div class="modal" id="modal"><div class="dialog"><h2>Edit QSO</h2><div class="fields" id="fields"></div><div class="actions"><button onclick="closeEdit()">Odustani</button><button class="edit" id="save" onclick="saveEdit()">SAVE promjene</button></div><p id="error" style="color:#ff9d91"></p></div></div>\n<script>\nlet data=[], current=-1;const $=id=>document.getElementById(id);const cols=[\'QSO_DATE\',\'TIME_ON\',\'CALL\',\'BAND\',\'FREQ\',\'MODE\',\'RST_SENT\',\'RST_RCVD\',\'NAME\',\'QTH\'];const names=[\'Date YYYYMMDD\',\'UTC HHMMSS\',\'Callsign\',\'Band\',\'Frekvencija MHz\',\'Mode\',\'RSTsend\',\'RSTrecv\',\'Name\',\'QTH\'];const limits=[8,6,10,8,16,12,3,3,10,15];\nfunction td(tr,value){const cell=document.createElement(\'td\');cell.textContent=value||\'\';tr.appendChild(cell)}\nfunction render(){const q=$(\'search\').value.toLowerCase();const tbody=$(\'rows\');tbody.replaceChildren();let shown=0;data.forEach((r,i)=>{if(q&&!Object.values(r).some(v=>String(v).toLowerCase().includes(q)))return;shown++;const tr=document.createElement(\'tr\');td(tr,String(i+1));cols.forEach(k=>{let value=r[k]||'';if(k==='QSO_DATE'&&/^\\d{8}$/.test(value)){value=value.slice(6,8)+'/'+value.slice(4,6)+'/'+value.slice(0,4)}td(tr,value)});const cell=document.createElement(\'td\');const btn=document.createElement(\'button\');btn.className=\'edit\';btn.textContent=\'Edit\';btn.onclick=()=>edit(i);cell.appendChild(btn);const del=document.createElement('button');del.className='delete';del.textContent='Delete';del.onclick=()=>deleteQSO(i);cell.appendChild(del);tr.appendChild(cell);tbody.appendChild(tr)});$(\'count\').textContent=shown+\' / \'+data.length+\' QSO\'}\nasync function load(){try{const r=await fetch(\'/api/log/entries\',{cache:\'no-store\'});const d=await r.json();if(!r.ok||!d.ok)throw Error(d.err||\'Greška čitanja\');data=d.records;render();$(\'status\').textContent=\'\'}catch(e){$(\'status\').textContent=e.message}}\nfunction edit(i){current=i;$(\'fields\').replaceChildren();cols.forEach((k,j)=>{const label=document.createElement(\'label\');label.textContent=names[j];const inp=document.createElement(\'input\');inp.id=\'field_\'+k;inp.maxLength=limits[j];inp.value=data[i][k]||\'\';label.appendChild(inp);$(\'fields\').appendChild(label)});$(\'error\').textContent=\'\';$(\'modal\').style.display=\'flex\'}\nfunction closeEdit(){$(\'modal\').style.display=\'none\';current=-1}\nasync function deleteQSO(i){const r=data[i];if(!r)return;const label=(r.CALL||'?')+' / '+(r.QSO_DATE||'')+' '+(r.TIME_ON||'')+' UTC';if(!confirm('Trajno obrisati QSO '+label+'? Prije brisanja izrađuje se .adi.bak kopija.'))return;try{const res=await fetch('/api/log/entries/'+i,{method:'DELETE'});const d=await res.json();if(!res.ok||!d.ok)throw Error(d.err||'Greška brisanja');await load();$('status').textContent='QSO obrisan (backup .adi.bak)'}catch(e){$('status').textContent=e.message}}
+async function saveEdit(){if(current<0)return;const fields={};cols.forEach(k=>fields[k]=$(\'field_\'+k).value);$(\'save\').disabled=true;try{const r=await fetch(\'/api/log/entries/\'+current,{method:\'PUT\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({fields})});const d=await r.json();if(!r.ok||!d.ok)throw Error(d.err||\'Greška spremanja\');closeEdit();await load();$(\'status\').textContent=\'Promjene spremljene u ADIF (backup .adi.bak)\'}catch(e){$(\'error\').textContent=e.message}finally{$(\'save\').disabled=false}}\nload();\n</script></body></html>'''
+
+CW_PAGE = r"""<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IC-7300 CW console</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#2d3748;--txt:#dbe4ee;--dim:#7d8aa0;--grn:#3fb950;--red:#f85149}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:Segoe UI,Roboto,Arial,sans-serif;max-width:760px;margin:0 auto;padding:12px}
+h1{font-size:18px;margin-bottom:12px;letter-spacing:1px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+.rowlabel{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+.grid{display:flex;flex-wrap:wrap;gap:5px}
+button{background:#1c2430;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-size:14px;cursor:pointer}
+button:hover{border-color:#58a6ff}
+button:active{transform:scale(.95)}
+button.on{background:#123a24;border-color:var(--grn);color:var(--grn);font-weight:bold}
+button.small{padding:6px 10px;font-size:12px}
+button.warn{border-color:var(--red);color:#ffb3ae}
+input[type=text]{width:100%;background:#0a0e14;border:1px solid var(--line);border-radius:8px;color:#f5a623;
+ font-family:Consolas,monospace;font-size:18px;padding:10px 12px;letter-spacing:1px}
+#macroinputs{display:grid;grid-template-columns:1fr;gap:5px;margin-top:8px}
+#macroinputs input{background:#0a0e14;border:1px solid var(--line);border-radius:8px;color:var(--txt);
+ padding:8px 10px;font-family:monospace;font-size:14px}
+#stat{font-size:12px;color:var(--dim);margin-top:10px;font-family:monospace}
+.row{display:flex;gap:6px;margin-top:8px}
+.row input{flex:1}
+</style>
+</head>
+<body>
+<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px"><h1 style="margin-bottom:0">IC-7300 <span style="color:var(--dim)">CW CONSOLE</span></h1><button onclick="window.open('/','_blank')" style="background:#23517a;font-weight:700">Save QSO</button></div>
+
+<div class="panel">
+  <div class="rowlabel">Filter</div>
+  <div class="grid" id="filts"></div>
+</div>
+
+<div class="panel">
+  <div class="rowlabel">CW makronaredbe (klik = predaja)</div>
+  <div class="row" style="align-items:center"><span style="font-size:12px;color:var(--dim)">Callsign:</span><input id="callsign" placeholder="Call" maxlength="12" style="flex:0 0 130px;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:#0a0e14;color:#f5a623;font-family:monospace;font-size:13px"><span style="font-size:12px;color:var(--dim);margin-left:8px">RST:</span><input id="rst" placeholder="599" maxlength="6" style="flex:0 0 70px;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:#0a0e14;color:#f5a623;font-family:monospace;font-size:13px"></div>
+  <div class="grid" id="macros"></div>
+  <div class="row">
+    <button class="small" onclick="toggleEdit()">Edit macros</button>
+    <button class="small warn" onclick="send('cw_stop')">Stop CW / TX</button>
+  </div>
+  <div id="macroedit" style="display:none">
+    <div id="macroinputs"></div>
+    <button class="small" style="margin-top:6px" onclick="saveMacros()">Save macros</button>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="rowlabel">Direct CW text</div>
+  <div class="row">
+    <input type="text" id="cwtext" placeholder="Direct CW text input... K" autocomplete="off">
+    <button onclick="sendText()">TX</button>
+  </div>
+</div>
+
+<div id="stat">connecting...</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let ws = null, MACROS = ['','','','','','','','','','','','','','',''];
+
+function send(k, v = null){ if(ws && ws.readyState === 1) ws.send(JSON.stringify({k, v})); }
+
+// --- filteri ---
+[1,2,3].forEach(f => {
+  const b = document.createElement('button');
+  b.textContent = 'FIL' + f; b.id = 'f' + f; b.style.flex = '1';
+  b.onclick = () => send('filter', f);
+  $('filts').appendChild(b);
+});
+
+// --- makroi ---
+let MNAMES = ['M1','M2','M3','M4','M5','M6','M7','M8','M9','M10','M11','M12','M13','M14','M15'];
+function cwSub(t){ return t.replace(/\(call\)/g, ($('callsign').value || '').trim().toUpperCase())
+                         .replace(/\(rst\)/g, (($('rst') || {value:''}).value || '').trim().toUpperCase()); }
+function build(){
+  const box = $('macros'); box.innerHTML = '';
+  MACROS.forEach((t, i) => {
+    const b = document.createElement('button');
+    b.className = 'small'; b.style.flex = '1';
+    b.textContent = MNAMES[i] + (t ? ' ·' : '');
+    b.title = MNAMES[i] + ': ' + (t || '(prazno)');
+    b.onclick = () => { if (t) send('cw', cwSub(t)); };
+    b.oncontextmenu = ev => { ev.preventDefault();
+      const n = (prompt('New macro name ' + MNAMES[i] + ' (max 8 char):', MNAMES[i]) || '').trim().slice(0, 8);
+      if (n) { MNAMES[i] = n; saveMacros(); } };
+    box.appendChild(b);
+  });
+}
+function toggleEdit(){
+  const ed = $('macroedit');
+  ed.style.display = ed.style.display === 'none' ? 'block' : 'none';
+  const box = $('macroinputs'); box.innerHTML = '';
+  MACROS.forEach((t, i) => {
+    const inp = document.createElement('input');
+    inp.value = t; inp.maxLength = 1000;
+    inp.placeholder = 'M' + (i + 1) + ' (max 1000 characters)';
+    inp.oninput = () => MACROS[i] = inp.value;
+    box.appendChild(inp);
+  });
+}
+async function saveMacros(){
+  try{
+    const r=await fetch('/api/macros',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({macros:MACROS,names:MNAMES})});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.err||'Spremanje nije uspjelo');
+    const check=await fetch('/api/macros',{cache:'no-store'});
+    if(!check.ok)throw Error('Ne mogu potvrditi spremljene makroe');
+    const saved=await check.json();
+    if(JSON.stringify(saved.macros)!==JSON.stringify(MACROS))throw Error('Provjera spremljenih makroa nije uspjela');
+    $('macroedit').style.display='none';build();
+  }catch(e){alert('CW makroi: '+e.message);}
+}
+fetch('/api/macros').then(r => r.json()).then(d => {
+  MACROS = (d.macros || []).concat(['','','','','','','','','','','','','','','']).slice(0,15);
+  if (d.names) MNAMES = (d.names || []).concat(['M1','M2','M3','M4','M5','M6','M7','M8','M9','M10','M11','M12','M13','M14','M15']).slice(0,15);
+  build(); });
+
+// --- direktni tekst ---
+function sendText(){
+  const el = $('cwtext');
+  if (el.value.trim()) send('cw', cwSub(el.value));
+  el.value = ''; el.focus();
+}
+$('cwtext').addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+
+// --- websocket: stanje radija (isto kao index.html) ---
+function connect(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host + '/ws');
+  ws.onopen = () => $('stat').textContent = 'LINK OK';
+  ws.onclose = () => { $('stat').textContent = 'LINK disconnected - connecting...'; setTimeout(connect, 2000); };
+  ws.onmessage = e => {
+    if (typeof e.data !== 'string') return;              // binarno: waterfall/audio
+    try {
+      const d = JSON.parse(e.data);
+      if (d.filt !== undefined) [1,2,3].forEach(f => $('f' + f).classList.toggle('on', d.filt === f));
+      $('stat').textContent = 'LINK OK · mod ' + (d.mode !== undefined ? d.mode : '')
+        + ' · FIL' + (d.filt !== undefined ? d.filt : '')
+        + (d.ptt ? ' · TX' : '');
+    } catch (x) {}
+  };
+}
+connect();
+</script>
+</body>
+</html>
+"""
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="hr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IC-7300 Web</title>
+<style>
+:root{--bg:#10141a;--card:#1a212b;--fg:#e6edf3;--mut:#7d8a99;--acc:#f5a524;--on:#2ea043;--tx:#e5484d}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;padding:8px;max-width:1000px;margin:auto}
+.card{background:var(--card);border-radius:8px;padding:8px;margin-bottom:6px}
+header{display:flex;justify-content:space-between;color:var(--mut);font-size:13px;margin-bottom:4px}
+#freq{font:600 clamp(22px,5.5vw,38px) ui-monospace,Consolas,monospace;color:var(--acc);text-align:center;user-select:none;letter-spacing:1px}
+#freq span{cursor:ns-resize;padding:0 1px}#freq span:hover{background:#ffffff14;border-radius:4px}
+#freq .dot{cursor:default;padding:0}
+.row{display:flex;flex-wrap:wrap;gap:4px;margin:2px 0}
+button{background:#2a3441;color:var(--fg);border:0;border-radius:5px;padding:4px 8px;font-size:12.5px;cursor:pointer}
+button:hover{background:#344255}button.on{background:var(--on)}button.sel{background:var(--acc);color:#000}
+#ptt,#pttToggle{flex:1;padding:10px;font-size:16px;font-weight:700;touch-action:none}#ptt.on,#pttToggle.on{background:var(--tx)}
+.sl{display:grid;grid-template-columns:56px 1fr 40px;gap:6px;align-items:center;margin:3px 0;font-size:12.5px}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:16px;background:transparent;cursor:pointer}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--on) var(--fill,50%),#3a4553 var(--fill,50%))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:14px;height:14px;margin-top:-4px;border-radius:50%;background:#e6edf3;border:2px solid var(--on)}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:#3a4553}
+input[type=range]::-moz-range-progress{height:6px;border-radius:3px;background:var(--on)}
+input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:#e6edf3;border:2px solid var(--on)}
+.meter{height:10px;background:#0b0f14;border-radius:4px;overflow:hidden}.meter div{height:100%;background:linear-gradient(90deg,#2ea043,#f5a524 60%,#e5484d);width:0}
+.grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,.9fr) 160px;gap:6px}@media(max-width:820px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){.grid{grid-template-columns:1fr}}
+#vfoWheel{height:116px;width:116px;margin:5px auto 7px;border-radius:50%;border:5px solid #3b4655;background:repeating-conic-gradient(from var(--vfo-angle,0deg),#4b5a6b 0deg 3deg,#1c2530 3deg 12deg);box-shadow:inset 0 0 0 17px #242f3c,0 3px 9px #0008;touch-action:none;cursor:grab;user-select:none;position:relative}
+#vfoWheel:active{cursor:grabbing}#vfoWheel:after{content:"VFO";position:absolute;inset:30px;border-radius:50%;display:grid;place-items:center;background:#101820;color:var(--acc);font-weight:700;font-size:12px;letter-spacing:1px;border:2px solid #566375}
+#vfoStep{width:100%;background:#0b0f14;color:var(--fg);border:1px solid #3b4655;border-radius:4px;padding:4px;font-size:12px}#vfoStatus{text-align:center;font-size:11px;color:var(--mut)}
+/* Kompaktni mjerni instrumenti u retku AUDIO/MIC/VOLUME. */
+.audioMeters{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}
+.metersInline{display:flex;align-items:center;gap:9px;flex:1;justify-content:flex-end;min-width:0}
+.miniMeter{display:grid;grid-template-columns:auto minmax(25px,1fr) 28px;align-items:center;gap:4px;min-width:85px;flex:1;font-size:11px}
+.miniMeter .meter{height:9px}.miniMeter span:last-child{text-align:right;font-size:10px}
+@media(max-width:780px){.audioMeters{flex-wrap:wrap}.metersInline{width:100%;flex-basis:100%}}
+/* Četiri neovisne kartice: MODE, SLIDERS, VFO, ROTATOR. */
+.grid{grid-template-columns:minmax(0,1.25fr) minmax(0,.95fr) 160px 160px}
+@media(max-width:820px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:500px){.grid{grid-template-columns:1fr}}
+#rotWheel{height:116px;width:116px;margin:5px auto 7px;border-radius:50%;border:5px solid #3b4655;background:repeating-conic-gradient(from 0deg,#586878 0deg 2deg,#1c2530 2deg 30deg);box-shadow:inset 0 0 0 14px #242f3c,0 3px 9px #0008;cursor:crosshair;touch-action:none;user-select:none;position:relative}
+#rotWheel:after{content:attr(data-az);position:absolute;inset:26px;border-radius:50%;display:grid;place-items:center;background:#101820;color:#4ce1bb;font-weight:700;font-size:19px;border:2px solid #566375}
+#rotWheel:before{content:none}
+/* Oznake kompasa i pokazivac stvarnog polozaja, ne ciljnog azimuta. */
+.rotDir{position:absolute;z-index:3;font:700 12px Consolas,monospace;color:#e3edf6;pointer-events:none;text-shadow:0 1px 2px #000}
+.rotN{top:3px;left:50%;transform:translateX(-50%);color:#4ce1bb}
+.rotS{bottom:2px;left:50%;transform:translateX(-50%)}
+.rotE{right:5px;top:50%;transform:translateY(-50%)}
+.rotW{left:5px;top:50%;transform:translateY(-50%)}
+#rotNeedle{position:absolute;inset:0;z-index:1;pointer-events:none;transform:rotate(0deg);transform-origin:center;transition:transform .4s linear}
+#rotNeedle:before{content:"";position:absolute;left:calc(50% - 3px);top:13px;width:6px;height:20px;background:#ffb44e;clip-path:polygon(50% 0,100% 100%,0 100%);filter:drop-shadow(0 1px 2px #000)}
+#rotNeedle:after{content:none}
+#rotWheel.rotOffline #rotNeedle{opacity:0}
+#rotWheel:after{z-index:2;pointer-events:none}
+#rotControls input{width:51px;min-width:0;text-align:center;background:#0b0f14;border:1px solid #3b4655;border-radius:4px;color:#f5a524;padding:3px;font-size:12px}
+#rotControls .row{justify-content:center;align-items:center;gap:3px;flex-wrap:nowrap}#rotControls button{padding:4px 6px;font-size:11px}
+#rotStatus{font-size:10px;color:#a6b2bf;line-height:1.2;margin-top:3px}
+h4{margin:0 0 4px;color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase}
+canvas{display:block;background:#0b0f14}
+</style></head><body>
+<header><b>IC-7300 web remote server by 9a3zi - ICweb v2.2</b><span><span id="splitb" style="color:#e5484d;font-weight:700;display:none">SPLIT · </span><span id="st">○ connecting…</span></span></header>
+
+<div class="card"><div id="freq"></div>
+<div id="txf" style="text-align:center;color:#e5484d;font:700 15px ui-monospace,monospace;display:none;margin-top:-2px;cursor:pointer" title="Klik = ponovno ocitaj TX frekvenciju"></div>
+<div class="row"><input id="fin" placeholder="MHz, ex. 14.074" style="flex:1;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:var(--fg);font-size:13px">
+<button onclick="goto()"> >>> </button>
+<button onclick="tx('vfo','A')">A</button><button onclick="tx('vfo','B')">B</button>
+<button onclick="tx('vfo','X')">A⇄B</button><button onclick="tx('vfo','EQ')">A=B</button></div>
+<div class="row" id="bands"></div></div>
+
+<div class="card"><canvas id="cv" width="475" height="100" style="width:100%;border-radius:6px;cursor:crosshair"></canvas>
+<div class="row" id="spans" style="align-items:center"></div>
+<div class="row" style="align-items:center;color:var(--mut)">Down <input type="range" id="flo" min="0" max="120" value="20" style="width:90px"> Up <input type="range" id="fhi" min="40" max="160" value="120" style="width:90px"><button type="button" onclick="shutdownPC()" style="background:#903b40;color:#fff;font-weight:700;margin-left:auto">SHUTDOWN PC</button></div></div>
+
+<div class="card" style="padding:6px 8px"><div class="audioMeters">
+<div class="row" style="align-items:center;margin:0;flex-wrap:nowrap;min-width:0"><button id="aud">🔇 Audio</button><button id="micbtn" type="button">🎤 MIC OFF</button>
+<span style="font-size:12px">Volume</span><input type="range" id="vol" min="0" max="200" value="100" style="width:105px;flex:0 1 105px"><span id="mic" style="color:var(--mut);font-size:11px"></span></div>
+<div class="metersInline"><div class="miniMeter"><span>S</span><div class="meter"><div id="m_s"></div></div><span id="t_s"></span></div>
+<div class="miniMeter"><span>PWR</span><div class="meter"><div id="m_p"></div></div><span id="t_p"></span></div>
+<div class="miniMeter"><span>SWR</span><div class="meter"><div id="m_w"></div></div><span id="t_w"></span></div></div></div></div>
+
+<div class="grid">
+<div class="card"><h4>Mode</h4><div class="row" id="modes"></div>
+<h4 style="margin-top:10px">Filter</h4><div class="row" id="filts"></div>
+<h4 style="margin-top:10px">Functions</h4><div class="row" id="tog"></div>
+<div class="row" id="pre"></div></div>
+
+<div class="card" id="sliders"></div>
+<div class="card" style="text-align:center"><h4>VFO Tuning</h4>
+<div id="vfoWheel" title="hold the left mouse button and move in a circle to select"></div>
+<select id="vfoStep" aria-label="Frequency adjustment step"><option value="10">10 Hz</option><option value="100">100 Hz</option><option value="1000" selected>1 kHz</option><option value="10000">10 kHz</option></select>
+<div id="vfoStatus">Step 1 kHz</div></div>
+<div class="card" style="text-align:center"><h4>Rotator · RAK</h4><div id="rotWheel" class="rotOffline" data-az="---°" title="Strelica pokazuje stvarni azimut rotora"><span class="rotDir rotN">N</span><span class="rotDir rotE">E</span><span class="rotDir rotS">S</span><span class="rotDir rotW">W</span><span id="rotNeedle"></span></div>
+<div id="rotControls"><div class="row"><input id="rotTarget" type="number" min="0" max="359" value="270" aria-label="Željeni azimut"><span>°</span><button id="rotGo" type="button">GO</button><button id="rotStop" type="button" style="background:#903b40">STOP</button></div><div id="rotSafety" style="font:10px Consolas,monospace;color:#e5b45a;line-height:1.3;margin-top:3px">MONITOR: ACTIVE</div><div class="row" style="justify-content:center"><button id="rotReset" type="button" style="background:#60512b">RESET SAFETY</button></div></div></div>
+</div>
+
+<div class="card"><h4></h4>
+<div class="row" style="align-items:center"><span style="font-size:12px;color:var(--mut)">Callsign:</span><input id="callsign" placeholder="Call" maxlength="10" autocomplete="off" style="flex:0 0 10ch;width:10ch;min-width:0;padding:5px 3px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"><span style="font-size:12px;color:var(--mut);margin-left:8px">RSTsend→:</span><input id="rst" placeholder="599" maxlength="3" autocomplete="off" title="Poslani raport (makroi (rst) povlače ovaj)" style="flex:0 0 3.8ch;width:3.8ch;min-width:0;padding:5px 2px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"><span style="font-size:12px;color:var(--mut);margin-left:6px">RSTrecv←:</span><input id="rstrcv" placeholder="599" maxlength="3" autocomplete="off" title="Primljeni raport" style="flex:0 0 3.8ch;width:3.8ch;min-width:0;padding:5px 2px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"><span style="font-size:12px;color:var(--mut);margin-left:6px">Name:</span><input id="qsoname" maxlength="10" autocomplete="off" style="flex:0 0 105px;min-width:0;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"><span style="font-size:12px;color:var(--mut);margin-left:6px">QTH:</span><input id="qth" maxlength="15" autocomplete="off" style="flex:0 0 145px;min-width:0;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"><button id="savebtn" onclick="saveQSO()">SAVE</button><button onclick="window.open('/log','_blank')" style="margin-left:22px;background:#23517a;font-weight:700">LOG</button><button onclick="window.open('/cw','_blank')" style="background:#23517a;font-weight:700">CW console</button></div>
+<div class="row" style="align-items:center"><span style="font-size:12px;color:var(--mut)">My call:</span><input id="mycall" placeholder="Call" maxlength="12" autocomplete="off" onchange="saveMy()" style="flex:0 0 110px;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"><span style="font-size:12px;color:var(--mut);margin-left:8px">My loc:</span><input id="grid" placeholder="JN85" maxlength="8" autocomplete="off" onchange="saveMy()" style="flex:0 0 70px;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:#f5a623;font-family:ui-monospace,monospace;font-size:13px"></div>
+<div class="row" id="macros"></div>
+<div class="row"><button onclick="toggleEdit()">Edit macro</button>
+<span style="font-size:12px;color:var(--mut)">CW MONITOR</span>
+<button id="cwmonbtn" type="button" onclick="toggleCWMonitor()">ON</button>
+<label style="font-size:12px">Hz <input id="cwmonhz" type="number" min="400" max="1000" step="50" value="650" style="width:65px" onchange="saveCWMonitor()"></label>
+<label style="font-size:12px">Vol <input id="cwmonvol" type="range" min="0" max="100" value="30" oninput="saveCWMonitor()" style="width:85px"></label>
+<span id="cwmonpct" style="font-size:12px">30%</span>
+</div>
+<div id="medit" style="display:none">
+<div id="minp" style="display:grid;gap:4px;margin:6px 0"></div>
+<button onclick="saveMacros()">Save macros</button></div>
+<h4 style="margin-top:10px"></h4>
+<div class="row"><input id="cwtxt" placeholder="Direct cw text input ..." autocomplete="off"
+ style="flex:1;padding:5px 8px;border-radius:5px;border:0;background:#0b0f14;color:var(--fg);font-family:ui-monospace,monospace;font-size:13px">
+<button onclick="sendCW()">TX</button></div>
+</div>
+</div>
+
+<div class="row"><button id="ptt">PTT (hold)</button><button id="pttToggle">PTT (toggle)</button><button onclick="tx('tuner',2)">TUNE</button>
+<button style="background:var(--tx);font-weight:700" onclick="tx('cw_stop')">STOP TX</button>
+<button onclick="if(confirm('Isključiti IC-7300?'))tx('powerbtn',0)">POWER OFF</button>
+<button onclick="tx('powerbtn',1)" title="Radi samo ako je radio u standbyu (isključen preko softvera, ne na tipku)">POWER ON</button></div>
+
+<script>
+const S={};let ws;const $=id=>document.getElementById(id);
+const BANDS=[['160',1840000],['80',3700000],['60',5357000],['40',7100000],['30',10120000],['20',14200000],['17',18100000],['15',21200000],['12',24900000],['10',28400000],['6',50150000],['4',70100000]];
+const MODES=['LSB','USB','CW','CW-R','AM','FM','RTTY'];
+const TOG=[['nb','NB'],['nr','NR'],['anf','ANF'],['att','ATT 20dB'],['split','SPLIT'],['tuner','TUNER']];
+const PCT=['af','rf','sql','power'];   // ovi se prikazuju 0-100 (radi vrijednost / 2.55)
+const SL=[['af','AF',0,255,0],['rf','RF',0,255,255],['sql','SQL',0,255,0],['power','TX power',0,255,0],['cwspd','CW speed',4,48,20]];
+const PRE=[[0,'PRE OFF'],[1,'P.AMP1'],[2,'P.AMP2']];
+const tx=(k,v=null)=>ws&&ws.readyState==1&&ws.send(JSON.stringify({k,v}));
+function setFill(el){const mn=+el.min||0,mx=+el.max||100;
+  el.style.setProperty('--fill',((el.value-mn)/(mx-mn)*100)+'%')}
+addEventListener('input',e=>{if(e.target.type==='range')setFill(e.target)});
+
+// frekvencija: klik gore/dolje ili kotačić na znamenci
+const PL=[1e7,1e6,1e5,1e4,1e3,100,10,1];
+PL.forEach((p,i)=>{
+  const s=document.createElement('span');s.dataset.p=p;s.id='d'+i;$('freq').appendChild(s);
+  if(i==1||i==4){const d=document.createElement('span');d.className='dot';d.textContent='.';$('freq').appendChild(d)}
+  const step=dir=>tx('freq',Math.max(30000,(S.freq||0)+dir*p));
+  s.onclick=e=>step(e.offsetY<s.offsetHeight/2?1:-1);
+  s.onwheel=e=>{e.preventDefault();step(e.deltaY<0?1:-1)};
+});
+function goto(){const v=parseFloat($('fin').value.replace(',','.'));if(v>0)tx('freq',Math.round(v*1e6))}
+$('fin').onkeydown=e=>{if(e.key=='Enter')goto()};
+
+// VFO kotač: relativno pomicanje, bez slanja previše CI-V naredbi.
+const vfoWheel=$('vfoWheel'),vfoStep=$('vfoStep');
+let rotTarget=270,rotDrag=null;
+let vfoPending=null,vfoTimer=null,vfoDrag=null,vfoAccum=0;
+vfoStep.value=localStorage.getItem('icweb_vfo_step')||'1000';
+function vfoLabel(){ $('vfoStatus').textContent='Step '+vfoStep.options[vfoStep.selectedIndex].text; }
+vfoStep.onchange=()=>{localStorage.setItem('icweb_vfo_step',vfoStep.value);vfoLabel()};vfoLabel();
+function vfoFlush(){
+  vfoTimer=null;
+  if(vfoPending!==null&&ws&&ws.readyState===1){tx('freq',vfoPending);vfoPending=null;}
+}
+function vfoTune(n){
+  if(!Number.isFinite(S.freq)||!S.freq)return;
+  const base=vfoPending===null?S.freq:vfoPending;
+  const f=Math.max(30000,Math.min(74999999,base+n*Number(vfoStep.value)));
+  vfoPending=Math.round(f);
+  if(vfoTimer===null)vfoTimer=setTimeout(vfoFlush,65);
+}
+vfoWheel.addEventListener('wheel',e=>{e.preventDefault();const n=e.deltaY<0?1:-1;vfoAngle=(vfoAngle+n*15)%360;vfoRotate();vfoTune(n)},{passive:false});
+// Kružno upravljanje: kut miša oko središta kotača; 24 koraka po krugu.
+let vfoAngle=0;
+function vfoPointerAngle(e){
+  const r=vfoWheel.getBoundingClientRect();
+  return Math.atan2(e.clientY-(r.top+r.height/2),e.clientX-(r.left+r.width/2));
+}
+function vfoRotate(){vfoWheel.style.setProperty('--vfo-angle',vfoAngle+'deg');}
+vfoWheel.addEventListener('pointerdown',e=>{
+  if(e.button!==0)return;
+  vfoDrag={id:e.pointerId,angle:vfoPointerAngle(e)};
+  vfoAccum=0;
+  vfoWheel.setPointerCapture(e.pointerId);e.preventDefault();
+});
+vfoWheel.addEventListener('pointermove',e=>{
+  if(!vfoDrag||e.pointerId!==vfoDrag.id)return;
+  const angle=vfoPointerAngle(e);
+  // Normalizacija prijelaza preko -180 / +180 stupnjeva.
+  let delta=angle-vfoDrag.angle;
+  if(delta>Math.PI)delta-=2*Math.PI;
+  if(delta<-Math.PI)delta+=2*Math.PI;
+  vfoDrag.angle=angle;
+  vfoAngle=(vfoAngle+delta*180/Math.PI)%360;
+  vfoRotate();
+  vfoAccum+=delta;
+  const n=Math.trunc(vfoAccum/(Math.PI/12));
+  if(n){vfoAccum-=n*(Math.PI/12);vfoTune(n);}
+});
+function vfoEnd(e){if(vfoDrag&&e.pointerId===vfoDrag.id){vfoDrag=null;vfoAccum=0;}}
+vfoWheel.addEventListener('pointerup',vfoEnd);
+vfoWheel.addEventListener('pointercancel',vfoEnd);
+// PC se gasi samo nakon dvostruke potvrde i provjere tajnog kljuca na serveru.
+async function shutdownPC(){
+  if(!confirm('Iskljuciti klubski PC? (Jeste li ugasili IC7300 "POWER OFF"?)'))return;
+  const key=prompt('Upisi sigurnosni kljuc za SHUTDOWN PC:');
+  if(!key)return;
+  if(!confirm('POSLJEDNJA POTVRDA: zaista iskljuciti PC?'))return;
+  try{
+    const r=await fetch('/api/pc/shutdown',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      credentials:'same-origin',cache:'no-store',body:JSON.stringify({key})
+    });
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.err||'Gasenje nije uspjelo');
+    alert('Naredba za gasenje Windows PC-a prihvacena.');
+  }catch(e){alert('SHUTDOWN PC: '+e.message)}
+}
+// Zaseban rotator kotačić: klik bira cilj, strelica pokazuje stvarni položaj.
+const rotWheel=$('rotWheel');
+function setRotTarget(deg){
+  rotTarget=((Math.round(deg)%360)+360)%360;
+  $('rotTarget').value=rotTarget;
+  // Odabir cilja zasad ne pokrece motor.
+}
+function rotPointer(e){
+  const r=rotWheel.getBoundingClientRect();
+  const dx=e.clientX-(r.left+r.width/2),dy=e.clientY-(r.top+r.height/2);
+  setRotTarget(Math.atan2(dx,-dy)*180/Math.PI);
+}
+rotWheel.addEventListener('pointerdown',e=>{
+  if(e.button!==0)return;
+  rotDrag={id:e.pointerId};rotWheel.setPointerCapture(e.pointerId);rotPointer(e);e.preventDefault();
+});
+rotWheel.addEventListener('pointermove',e=>{if(rotDrag&&rotDrag.id===e.pointerId)rotPointer(e)});
+function rotEnd(e){if(rotDrag&&rotDrag.id===e.pointerId)rotDrag=null}
+rotWheel.addEventListener('pointerup',rotEnd);
+rotWheel.addEventListener('pointercancel',rotEnd);
+rotWheel.addEventListener('wheel',e=>{e.preventDefault();setRotTarget(rotTarget+(e.deltaY<0?1:-1))},{passive:false});
+$('rotTarget').onchange=()=>setRotTarget(Number($('rotTarget').value)||0);
+$('rotGo').onclick=()=>{
+  if(S.rot_connected!==true){alert('Nema veze s rotatorom.');return;}
+  const target=Number($('rotTarget').value);
+  if(!Number.isInteger(target)||target<0||target>359){alert('Azimut mora biti 0-359.');return;}
+  tx('rot_go',target);
+};
+$('rotStop').onclick=()=>tx('rot_stop',1);
+$('rotReset').onclick=()=>{if(confirm('RESET SAFETY samo nakon provjere da rotor miruje i da su granice sigurne. Nastaviti?'))tx('rot_reset',1)};
+
+// UI elementi
+for(const[b,f]of BANDS){const e=document.createElement('button');e.textContent=b+'m';e.onclick=()=>tx('freq',f);$('bands').appendChild(e)}
+MODES.forEach(m=>{const e=document.createElement('button');e.textContent=m;e.id='mode_'+m;e.onclick=()=>tx('mode',m);$('modes').appendChild(e)});
+TOG.forEach(([k,l])=>{const e=document.createElement('button');e.textContent=l;e.id='tog_'+k;e.onclick=()=>tx(k,S[k]?0:1);$('tog').appendChild(e)});
+PRE.forEach(([v,l])=>{const e=document.createElement('button');e.textContent=l;e.id='pre_'+v;e.onclick=()=>tx('preamp',v);$('pre').appendChild(e)});
+SL.forEach(([k,l,mn,mx,df])=>{$('sliders').insertAdjacentHTML('beforeend',`<div class="sl"><span>${l}</span><input type="range" id="s_${k}" min="${mn}" max="${mx}" value="${df}"><span id="v_${k}"></span></div>`);
+  $('s_'+k).oninput=e=>{$('v_'+k).textContent=PCT.includes(k)?Math.round(e.target.value/2.55):e.target.value;tx(k,+e.target.value)}});
+document.querySelectorAll('input[type=range]').forEach(setFill);   // pocetna ispuna prema value atributu
+
+// filteri FIL1/2/3
+[1,2,3].forEach(f=>{const e=document.createElement('button');e.textContent='FIL'+f;e.id='filt_'+f;
+  e.onclick=()=>tx('filter',f);$('filts').appendChild(e)});
+
+// CW makronaredbe M1-M8 + direktni unos
+let MACROS=['','','','','','','','','','','','','','',''],MNAMES=['M1','M2','M3','M4','M5','M6','M7','M8','M9','M10','M11','M12','M13','M14','M15'];
+// Lokalni Web Audio sidetone prati RTS/DTR key događaje s poslužitelja.
+let cwMonitorEnabled=localStorage.getItem('cwmon_enabled')!=='0';
+let cwMonitorHz=+(localStorage.getItem('cwmon_hz')||650);
+let cwMonitorVol=+(localStorage.getItem('cwmon_vol')||30);
+let cwAudioCtx=null,cwOsc=null,cwGain=null;
+$('cwmonhz').value=cwMonitorHz;$('cwmonvol').value=cwMonitorVol;
+function saveCWMonitor(){
+  cwMonitorHz=Math.max(400,Math.min(1000,+$('cwmonhz').value||650));
+  cwMonitorVol=Math.max(0,Math.min(100,+$('cwmonvol').value||0));
+  $('cwmonhz').value=cwMonitorHz;$('cwmonpct').textContent=cwMonitorVol+'%';
+  localStorage.setItem('cwmon_hz',cwMonitorHz);
+  localStorage.setItem('cwmon_vol',cwMonitorVol);
+  if(cwOsc)cwOsc.frequency.setTargetAtTime(cwMonitorHz,cwAudioCtx.currentTime,.005);
+  if(!cwMonitorEnabled)cwMonitorStop();
+}
+function initCWAudio(){
+  if(!cwAudioCtx){
+    cwAudioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    cwOsc=cwAudioCtx.createOscillator();cwGain=cwAudioCtx.createGain();
+    cwOsc.type='sine';cwOsc.frequency.value=cwMonitorHz;cwGain.gain.value=0;
+    cwOsc.connect(cwGain);cwGain.connect(cwAudioCtx.destination);cwOsc.start();
+  }
+  if(cwAudioCtx.state==='suspended')cwAudioCtx.resume();
+}
+function cwTone(down){
+  if(!cwAudioCtx||!cwGain)return;
+  const t=cwAudioCtx.currentTime;
+  cwGain.gain.cancelScheduledValues(t);
+  cwGain.gain.setTargetAtTime(down&&cwMonitorEnabled?cwMonitorVol/100*0.20:0,t,.003);
+}
+function toggleCWMonitor(){
+  cwMonitorEnabled=!cwMonitorEnabled;
+  localStorage.setItem('cwmon_enabled',cwMonitorEnabled?'1':'0');
+  updateCWMonitorUI();
+  if(cwMonitorEnabled)initCWAudio();else cwMonitorStop();
+}
+function updateCWMonitorUI(){
+  $('cwmonbtn').textContent=cwMonitorEnabled?'ON':'OFF';
+  $('cwmonbtn').className=cwMonitorEnabled?'on':'';
+}
+updateCWMonitorUI();saveCWMonitor();
+// Preglednici dopuštaju zvuk tek nakon korisničkog klika/tipa.
+document.addEventListener('pointerdown',()=>{if(cwMonitorEnabled)initCWAudio()},{passive:true});
+document.addEventListener('keydown',()=>{if(cwMonitorEnabled)initCWAudio()});
+
+const CW_MORSE={A:'.-',B:'-...',C:'-.-.',D:'-..',E:'.',F:'..-.',G:'--.',H:'....',I:'..',J:'.---',K:'-.-',L:'.-..',M:'--',N:'-.',O:'---',P:'.--.',Q:'--.-',R:'.-.',S:'...',T:'-',U:'..-',V:'...-',W:'.--',X:'-..-',Y:'-.--',Z:'--..',
+'0':'-----','1':'.----','2':'..---','3':'...--','4':'....-','5':'.....','6':'-....','7':'--...','8':'---..','9':'----.',
+'/':'-..-.','?':'..--..','.':'.-.-.-',',':'--..--','=':'-...-','+':'.-.-.','-':'-....-','@':'.--.-.',':':'---...'};
+// CW monitor: rasporedjuje samo kratki dio unaprijed; nova WPM vrijednost
+// koristi se za svaki sljedeci element, bez rasporedjivanja cijelog makroa.
+let cwMonitorEnd=0, cwMonitorTimer=null, cwMonitorEvents=[], cwMonitorIndex=0;
+function cwMonitorStop(){
+  if(cwMonitorTimer!==null){clearInterval(cwMonitorTimer);cwMonitorTimer=null;}
+  cwMonitorEvents=[];cwMonitorIndex=0;
+  if(!cwAudioCtx||!cwGain)return;
+  const now=cwAudioCtx.currentTime;
+  cwGain.gain.cancelScheduledValues(now);
+  cwGain.gain.setTargetAtTime(0,now,.003);
+  cwMonitorEnd=now;
+}
+function cwMonitorPlay(text,wpm){
+  cwMonitorStop();
+  if(!cwMonitorEnabled)return;
+  initCWAudio();
+  if(!cwAudioCtx||!cwGain)return;
+  // Eventi su {on,units}; 1u = 1.2/WPM sekundi.
+  let started=false,gap=false;
+  for(const c of String(text).toUpperCase()){
+    if(c===' '){gap=true;continue;}
+    const code=CW_MORSE[c];if(!code)continue;
+    if(started)cwMonitorEvents.push({on:false,units:gap?7:3});
+    started=true;gap=false;
+    for(let i=0;i<code.length;i++){
+      if(i)cwMonitorEvents.push({on:false,units:1});
+      cwMonitorEvents.push({on:true,units:code[i]==='.'?1:3});
+    }
+  }
+  if(!cwMonitorEvents.length)return;
+  cwMonitorIndex=0;
+  cwMonitorEnd=cwAudioCtx.currentTime+.08;
+  // Pocetni WPM je rezervna vrijednost dok ne stigne novo stanje radija.
+  const fallbackWpm=+wpm||20;
+  const tick=()=>{
+    if(!cwAudioCtx||!cwGain)return;
+    const ctx=cwAudioCtx,g=cwGain.gain;
+    while(cwMonitorIndex<cwMonitorEvents.length && cwMonitorEnd<ctx.currentTime+.10){
+      const ev=cwMonitorEvents[cwMonitorIndex++];
+      const speed=Math.max(5,Math.min(60,Number(S.cwspd)||fallbackWpm));
+      const duration=ev.units*1.2/speed;
+      const t=Math.max(cwMonitorEnd,ctx.currentTime+.005);
+      const level=cwMonitorVol/100*.20;
+      if(ev.on){
+        g.setValueAtTime(0,t);
+        g.linearRampToValueAtTime(level,t+.003);
+        g.setValueAtTime(level,Math.max(t+.003,t+duration-.003));
+        g.linearRampToValueAtTime(0,t+duration);
+      }else{
+        g.setValueAtTime(0,t);
+      }
+      cwMonitorEnd=t+duration;
+    }
+    if(cwMonitorIndex>=cwMonitorEvents.length){
+      clearInterval(cwMonitorTimer);cwMonitorTimer=null;
+    }
+  };
+  tick();
+  if(cwMonitorIndex<cwMonitorEvents.length)cwMonitorTimer=setInterval(tick,25);
+}
+function cwSub(t){return t.replace(/\(call\)/g,($('callsign').value||'').trim().toUpperCase())
+  .replace(/\(rst\)/g,($('rst').value||'').trim().toUpperCase())}
+function buildMacros(){const box=$('macros');box.innerHTML='';
+  MACROS.forEach((t,i)=>{const e=document.createElement('button');e.textContent=MNAMES[i]+(t?' ·':'');
+    e.title=MNAMES[i]+': '+(t||'(empty)')+'  (right click = rename)';
+    e.onclick=()=>t&&tx('cw',cwSub(t));
+    e.oncontextmenu=ev=>{ev.preventDefault();renameMacro(i)};box.appendChild(e)})}
+function renameMacro(i){
+  const n=(prompt('New macro name '+MNAMES[i]+' (max 8 char):',MNAMES[i])||'').trim().slice(0,8);
+  if(!n)return;
+  MNAMES[i]=n;saveMacros();
+}
+function toggleEdit(){const ed=$('medit');ed.style.display=ed.style.display=='none'?'block':'none';
+  const box=$('minp');box.innerHTML='';
+  MACROS.forEach((t,i)=>{const e=document.createElement('input');e.value=t;e.maxLength=1000;
+    e.placeholder=MNAMES[i]+' (max 1000 characters)';
+    e.style.cssText='padding:8px;border-radius:6px;border:0;background:#0b0f14;color:var(--fg);font-family:ui-monospace,monospace';
+    e.oninput=()=>MACROS[i]=e.value;box.appendChild(e)})}
+async function persistMacros(closeEditor=false){
+  try{
+    const payload={macros:MACROS,names:MNAMES,
+      mycall:($('mycall').value||'').trim().toUpperCase(),
+      gridsquare:($('grid').value||'').trim().toUpperCase()};
+    const r=await fetch('/api/macros',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw Error(d.err||'Spremanje nije uspjelo');
+    const check=await fetch('/api/macros',{cache:'no-store'});
+    if(!check.ok)throw Error('Ne mogu potvrditi spremljene makroe');
+    const saved=await check.json();
+    if(JSON.stringify(saved.macros)!==JSON.stringify(MACROS)||
+       JSON.stringify(saved.names)!==JSON.stringify(MNAMES)||
+       saved.mycall!==payload.mycall||saved.gridsquare!==payload.gridsquare)
+      throw Error('Podaci nakon spremanja nisu jednaki unesenima');
+    if(closeEditor)$('medit').style.display='none';
+    buildMacros();
+  }catch(e){alert('CW makroi: '+e.message);}
+}
+function saveMy(){return persistMacros(false)}
+function saveMacros(){return persistMacros(true)}
+function sendCW(){const e=$('cwtxt');if(e.value.trim())tx('cw',cwSub(e.value));e.value='';e.focus()}
+function saveQSO(){
+  const call=($('callsign').value||'').trim().toUpperCase(),rst=($('rst').value||'').trim().toUpperCase()||'599',
+        rstr=($('rstrcv').value||'').trim().toUpperCase()||'599',
+        name=($('qsoname').value||'').trim(),qth=($('qth').value||'').trim();
+  if(!call){const b=$('savebtn');b.textContent='UPISI CALL!';setTimeout(()=>b.textContent='SAVE',1500);return}
+  fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({call,rst,rstr,name,qth})}).then(r=>r.json()).then(d=>{
+      const b=$('savebtn');b.textContent=d.ok?('OK QSO '+d.count):'GRESKA';
+      if(d.ok){ ['callsign','rst','rstrcv','qsoname','qth'].forEach(id=>$(id).value=''); $('callsign').focus(); }
+      setTimeout(()=>b.textContent='SAVE',1500)})}
+// TAB navigacija isključivo kroz QSO unos i SAVE (Shift+Tab ide unatrag).
+const QSO_TAB_IDS=['callsign','rst','rstrcv','qsoname','qth','savebtn'];
+document.addEventListener('keydown', e=>{
+  if(e.key!=='Tab'||e.altKey||e.ctrlKey||e.metaKey)return;
+  // Ne presreći Tab dok je otvoren dijalog ili drugi prozor za uređivanje.
+  const current=QSO_TAB_IDS.indexOf(document.activeElement.id);
+  if(current<0 && document.activeElement!==document.body && document.activeElement!==document.documentElement)return;
+  e.preventDefault();
+  const next=current<0?0:(current+(e.shiftKey?-1:1)+QSO_TAB_IDS.length)%QSO_TAB_IDS.length;
+  $(QSO_TAB_IDS[next]).focus();
+});
+$('cwtxt').onkeydown=e=>{if(e.key=='Enter')sendCW()};
+fetch('/api/macros').then(r=>r.json()).then(d=>{
+  MACROS=(d.macros||[]).concat(['','','','','','','','','','','','','','','']).slice(0,15);
+  if(d.names)MNAMES=(d.names||[]).concat(['M1','M2','M3','M4','M5','M6','M7','M8','M9','M10','M11','M12','M13','M14','M15']).slice(0,15);
+  if(d.mycall)$('mycall').value=d.mycall;
+  if(d.gridsquare)$('grid').value=d.gridsquare;
+  buildMacros()});
+
+// PTT HOLD i PTT TOGGLE dijele isti mikrofon i istu TX vezu.
+const ptt=$('ptt'), pttToggle=$('pttToggle');
+let pttHeld=false, pttLatched=false;
+function pttReady(){
+  if(!micReady || !['USB','LSB'].includes(S.mode)){
+    $('mic').textContent='SSB TX: uključi MIC i odaberi USB/LSB';return false;
+  }
+  return !!ws && ws.readyState===1;
+}
+function pttActive(){return pttHeld||pttLatched}
+function releasePTT(){
+  if(!pttHeld)return;
+  pttHeld=false;
+  if(!pttLatched)tx('ptt',0);
+  render();
+}
+ptt.addEventListener('pointerdown',e=>{
+  if(!pttReady() || pttLatched)return;
+  pttHeld=true;ptt.setPointerCapture(e.pointerId);tx('ptt',1);render();
+});
+ptt.addEventListener('pointerup',releasePTT);
+ptt.addEventListener('pointercancel',releasePTT);
+pttToggle.addEventListener('click',()=>{
+  if(pttLatched){
+    pttLatched=false;
+    if(!pttHeld)tx('ptt',0);
+  }else{
+    if(!pttReady() || pttHeld)return;
+    pttLatched=true;tx('ptt',1);
+  }
+  render();
+});
+// HOLD se otpušta gubitkom fokusa, TOGGLE ostaje uključen.
+addEventListener('blur',releasePTT);
+// Zatvaranje stranice otpušta PTT (server dodatno otpušta pri prekidu WS veze).
+addEventListener('pagehide',()=>{pttHeld=false;pttLatched=false;tx('ptt',0)});
+
+$('txf').onclick=()=>tx('txfreq',1);
+function fmtT(hz){return Math.floor(hz/1e6)+'.'+String(Math.floor(hz%1e6/1e3)).padStart(3,'0')+'.'+String(Math.floor(hz%1e3/10)).padStart(2,'0')}
+function sTxt(v){if(v<=120)return'S'+Math.round(v/120*9);return'S9+'+Math.round((v-120)/121*60)+'dB'}
+function render(){
+  if(S.rot_connected===true && Number.isFinite(S.rot_az)){
+    rotWheel.dataset.az=Math.round(S.rot_az)+'°';
+    rotWheel.classList.remove('rotOffline');
+    // RAW daje kontinuirani mehanicki kut kroz sjever (bez skoka strelice na 0).
+    const needleDeg=Number.isFinite(S.rot_raw)?S.rot_raw:S.rot_az;
+    $('rotNeedle').style.transform='rotate('+needleDeg+'deg)';
+    $('rotSafety').textContent=(S.rot_fault?'SAFETY LOCK: '+S.rot_fault+' · '+(S.rot_stop_result||''):'MONITOR: ACTIVE');
+    $('rotSafety').style.color=S.rot_fault?'#ff7474':'#e5b45a';
+    $('rotGo').disabled=!!S.rot_fault;
+  } else if(S.rot_connected===false){
+    rotWheel.dataset.az='---°';
+    rotWheel.classList.add('rotOffline');
+    $('rotSafety').textContent=S.rot_fault?'SAFETY LOCK: '+S.rot_fault+' · '+(S.rot_stop_result||''):'MONITOR: NEMA VEZE';
+    $('rotGo').disabled=!!S.rot_fault;
+  }
+  if(S.freq!=null){const s=String(S.freq).padStart(8,'0');PL.forEach((p,i)=>$('d'+i).textContent=s[i])}
+  MODES.forEach(m=>$('mode_'+m).className=S.mode==m?'sel':'');
+  [1,2,3].forEach(f=>$('filt_'+f).className=S.filt===f?'sel':'');
+  TOG.forEach(([k])=>$('tog_'+k).className=S[k]?'on':'');
+  PRE.forEach(([v])=>$('pre_'+v).className=S.preamp==v?'sel':'');
+  SL.forEach(([k])=>{if(S[k]!=null&&document.activeElement!==$('s_'+k)){$('s_'+k).value=S[k];setFill($('s_'+k));$('v_'+k).textContent=PCT.includes(k)?Math.round(S[k]/2.55):S[k]}});
+  ptt.className=pttHeld?'on':'';
+  pttToggle.className=pttLatched?'on':'';
+  pttToggle.textContent=pttLatched?'PTT ON (click OFF)':'PTT (toggle)';
+  if(S.split&&S.txfreq!=null){$('txf').style.display='block';$('txf').textContent='TX '+fmtT(S.txfreq)}
+  else $('txf').style.display='none';
+  $('splitb').style.display=S.split?'inline':'none';
+  if(S.smeter!=null){$('m_s').style.width=S.smeter/241*100+'%';$('t_s').textContent=sTxt(S.smeter)}
+  if(S.pwr_meter!=null){$('m_p').style.width=S.pwr_meter/255*100+'%';$('t_p').textContent=Math.round(S.pwr_meter/2.55)+'%'}
+  if(S.swr!=null){$('m_w').style.width=S.swr/255*100+'%';$('t_w').textContent=S.swr<48?(1+S.swr/48*0.5).toFixed(1):S.swr<80?'~2':'>3'}
+}
+function conn(){
+  ws=new WebSocket((location.protocol=='https:'?'wss':'ws')+'://'+location.host+'/ws');
+  ws.onopen=()=>{ws.binaryType='arraybuffer';$('st').textContent='● connected';
+    };
+  ws.onclose=()=>{cwMonitorStop();pttHeld=false;pttLatched=false;render();$('st').textContent='○ disconnected';setTimeout(conn,1500)};
+  ws.onmessage=e=>{if(typeof e.data!=='string')return onBin(e.data);const msg=JSON.parse(e.data);if(msg.cw_monitor){cwMonitorPlay(msg.cw_monitor.text,msg.cw_monitor.wpm);return;}if(msg.cw_monitor_stop){cwMonitorStop();return;}Object.assign(S,msg);if(msg.ptt===0 && pttLatched && !pttHeld){pttLatched=false;}render()};
+}
+
+// ---------- waterfall ----------
+const cv=$('cv'),cx=cv.getContext('2d'),W=475,H=100,SH=40;let sc={lo:0,hi:0};
+const STOPS=[[0,0,0],[0,0,140],[0,200,220],[255,230,0],[255,40,0]];
+const LUT=Array.from({length:256},(_,i)=>{const x=i/255*4,j=Math.min(3,x|0),f=x-j;return STOPS[j].map((a,k)=>a+(STOPS[j+1][k]-a)*f)});
+cx.fillStyle='#0b0f14';cx.fillRect(0,0,W,H);
+function drawScope(d){
+  const n=d.length,lo=+$('flo').value,hi=Math.max(lo+10,+$('fhi').value);
+  cx.drawImage(cv,0,SH,W,H-SH-1,0,SH+1,W,H-SH-1);
+  const img=cx.createImageData(W,1);
+  for(let x=0;x<W;x++){const v=d[Math.min(n-1,x*n/W|0)],t=Math.max(0,Math.min(1,(v-lo)/(hi-lo))),c=LUT[t*255|0];img.data.set([c[0],c[1],c[2],255],x*4)}
+  cx.putImageData(img,0,SH);
+  cx.fillStyle='#0b0f14';cx.fillRect(0,0,W,SH);cx.strokeStyle='#f5a524';cx.beginPath();
+  for(let x=0;x<W;x++){const y=SH-1-d[Math.min(n-1,x*n/W|0)]/160*(SH-2);x?cx.lineTo(x,y):cx.moveTo(x,y)}
+  cx.stroke();
+  if(S.freq&&sc.hi>sc.lo){const x=(S.freq-sc.lo)/(sc.hi-sc.lo)*W;cx.fillStyle='#e5484d';cx.fillRect(x|0,0,1,H)}
+}
+cv.onclick=e=>{if(sc.hi<=sc.lo)return;const r=cv.getBoundingClientRect();
+  tx('freq',Math.round((sc.lo+(e.clientX-r.left)/r.width*(sc.hi-sc.lo))/10)*10)};
+[2500,5000,10000,25000,50000,100000,250000,500000].forEach(v=>{const b=document.createElement('button');
+  b.textContent='±'+(v>=1000?v/1000+'k':v);b.onclick=()=>tx('span',v);$('spans').appendChild(b)});
+
+// ---------- audio ----------
+let ac,gain,nextT=0;
+function onBin(buf){const v=new DataView(buf),t=v.getUint8(0);
+  if(t==1){sc.lo=v.getUint32(1);sc.hi=v.getUint32(5);drawScope(new Uint8Array(buf,9))}
+  else if(t==2)playRx(new Uint8Array(buf,1))}
+function playRx(d){
+  if(!ac||pttActive())return; // RX audio ne čeka zakašnjelo CI-V PTT stanje
+  const f=new Float32Array(d.length);
+  for(let i=0;i<d.length;i++){const y=d[i]/255*2-1;f[i]=Math.sign(y)*(Math.pow(256,Math.abs(y))-1)/255}
+  const b=ac.createBuffer(1,f.length,8000);b.copyToChannel(f,0);
+  const s=ac.createBufferSource();s.buffer=b;s.connect(gain);
+  const t=ac.currentTime;if(nextT<t+0.03)nextT=t+0.15;s.start(nextT);nextT+=b.duration}
+$('vol').oninput=()=>gain&&(gain.gain.value=$('vol').value/100);
+let micReady=false,micStream=null,micProcessor=null;
+async function startAudio(){
+  if(ac)return;
+  ac=new AudioContext();gain=ac.createGain();gain.gain.value=$('vol').value/100;
+  gain.connect(ac.destination);
+  $('aud').className='on';$('aud').textContent='🔊 Audio ON';
+}
+$('aud').onclick=()=>startAudio().catch(e=>$('mic').textContent='Audio: '+e.message);
+$('micbtn').onclick=async()=>{
+  if(micReady){
+    releasePTT();if(pttLatched){pttLatched=false;tx('ptt',0);render()}micReady=false;
+    if(micProcessor){micProcessor.disconnect();micProcessor.onaudioprocess=null;micProcessor=null}
+    if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null}
+    $('micbtn').textContent='🎤 MIC OFF';$('micbtn').className='';
+    $('mic').textContent='';return;
+  }
+  try{
+    await startAudio();
+    micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    const src=ac.createMediaStreamSource(micStream);
+    micProcessor=ac.createScriptProcessor(2048,1,1);
+    const silent=ac.createGain();silent.gain.value=0;
+    micProcessor.connect(silent);silent.connect(ac.destination); // bez lokalnog mikrofonskog monitoringa
+    micProcessor.onaudioprocess=e=>{
+      if(!pttActive()||!['USB','LSB'].includes(S.mode)||!ws||ws.readyState!==1)return;
+      const x=e.inputBuffer.getChannelData(0),r=ac.sampleRate/8000;
+      const n=Math.floor(x.length/r),o=new Uint8Array(n+1);o[0]=3;
+      for(let i=0;i<n;i++){
+        const a=Math.floor(i*r),b=Math.min(x.length,Math.floor((i+1)*r));
+        let v=0;for(let j=a;j<b;j++)v+=x[j];v/=Math.max(1,b-a);
+        const m=Math.sign(v)*Math.log1p(255*Math.min(1,Math.abs(v)))/Math.log(256);
+        o[i+1]=Math.round((m+1)/2*255);
+      }
+      if(ws.bufferedAmount<32000)ws.send(o);
+    };
+    src.connect(micProcessor);micReady=true;
+    $('micbtn').textContent='🎤 MIC ON';$('micbtn').className='on';
+    $('mic').textContent='mic ready';
+  }catch(e){$('mic').textContent='Mikrofon: '+e.message+' (HTTPS ili localhost)'}
+};
+conn();
+</script></body></html>
+"""
+
+
+
+class AlfaSpidReader:
+    """Samo citanje polozaja RAK kontrolera; ne sadrzi naredbe za pokretanje."""
+    QUERY = bytes.fromhex('57 00 00 00 00 00 00 00 00 00 00 1F 20')
+    STOP = bytes.fromhex('57 00 00 00 00 00 00 00 00 00 00 0F 20')
+    # Potvrdeno na stvarnom kontroleru: dva kraja na 180 stupnjeva
+    # imaju razlicite RAW vrijednosti (-180 i +180).
+    MIN_RAW, MAX_RAW = -180, 180
+
+    def __init__(self, port='COM6', baud=1200):
+        self.port, self.baud = port, baud
+        self.ser = None
+        self.last_error = ''
+
+    def close(self):
+        if self.ser is not None:
+            try: self.ser.close()
+            except Exception: pass
+        self.ser = None
+
+    def stop(self):
+        if self.ser is None:
+            raise RuntimeError('COM6 nije otvoren')
+        self.ser.write(self.STOP)
+        self.ser.flush()
+        # STOP vraca 5 bajtova, ali ce ih sljedeci STATUS ocitati nakon resetiranja buffera.
+
+    def go(self, az, current_raw):
+        if type(az) is not int or not 0 <= az <= 359:
+            raise ValueError('Neispravan azimut')
+        if type(current_raw) is not int or not self.MIN_RAW <= current_raw <= self.MAX_RAW:
+            raise ValueError('Stvarni polozaj nije potvrden unutar dozvoljenog raspona')
+        raw = az if az <= 179 else az - 360
+        if not self.MIN_RAW <= raw <= self.MAX_RAW:
+            raise ValueError('Cilj izvan dozvoljenog raspona')
+        if self.ser is None:
+            raise RuntimeError('COM6 nije otvoren')
+        h = f'{raw+360:03d}0'.encode('ascii')
+        packet = b'\x57' + h + b'\x00'*6 + b'\x2f\x20'
+        assert len(packet) == 13
+        self.ser.write(packet)
+        self.ser.flush()
+
+    def read(self):
+        try:
+            if self.ser is None:
+                dev = serial.Serial()
+                dev.port, dev.baudrate = self.port, self.baud
+                dev.bytesize, dev.parity, dev.stopbits = 8, 'N', 1
+                dev.timeout, dev.write_timeout = 1.5, 1.5
+                dev.rtscts, dev.dsrdtr = False, False
+                dev.rts, dev.dtr = False, False
+                dev.open()
+                self.ser = dev
+            self.ser.reset_input_buffer()
+            self.ser.write(self.QUERY)
+            self.ser.flush()
+            response = self.ser.read(5)
+            if len(response) != 5 or response[0] != 0x57 or response[4] != 0x20:
+                raise ValueError('Neispravan odgovor: ' + response.hex(' '))
+            raw = response[1] * 100 + response[2] * 10 + response[3] - 360
+            if not -360 <= raw <= 720:
+                raise ValueError('Azimut izvan raspona')
+            self.last_error = ''
+            return {'rot_connected': True, 'rot_az': raw % 360, 'rot_raw': raw, 'rot_wire': response.hex(' ').upper()}
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.close()
+            return {'rot_connected': False, 'rot_az': None, 'rot_error': self.last_error[:140]}
+
+def make_app(radio, password, audio=None):
+    app = web.Application(client_max_size=1024 * 1024)
+    app['shutdown_key'] = load_shutdown_key()
+    app['shutdown_attempts'] = {}
+    app['clients'] = set()
+    app['rotor'] = AlfaSpidReader()
+    app['rot_state'] = {'rot_connected': False, 'rot_az': None}
+    app['rot_lock'] = asyncio.Lock()
+    # Vrijednosti koje se mijenjaju nakon pokretanja drzimo u obicnom dict-u.
+    # aiohttp Application stanje ostaje nepromijenjeno nakon startup-a.
+    app['rot_runtime'] = {
+        'rot_last_read': 0.0, 'rot_target': None, 'rot_monitor_events': [],
+        'rot_fault': None, 'rot_stop_result': '', 'rot_last_good': None,
+        'rot_go_at': None,
+    }
+    app['ptt_owner'] = None
+    app['ptt_since'] = 0.0
+    app['ptt_last_audio'] = 0.0
+    app['macros'], app['macnames'], initial_mycall, initial_grid = load_macros()
+    app['macro_identity'] = {'mycall': initial_mycall, 'grid': initial_grid}
+    root = Path(__file__).parent
+
+    @web.middleware
+    async def auth(req, handler):
+        if password:
+            h = req.headers.get('Authorization', '')
+            ok = False
+            if h.startswith('Basic '):
+                try:
+                    ok = base64.b64decode(h[6:]).decode().split(':', 1)[1] == password
+                except Exception:
+                    pass
+            if not ok:
+                return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="IC-7300"'})
+        return await handler(req)
+    app.middlewares.append(auth)
+
+    async def index(_):
+        return web.Response(text=INDEX_HTML, content_type='text/html', charset='utf-8')
+
+    async def cw_page(_):
+        return web.Response(text=CW_PAGE, content_type='text/html', charset='utf-8')
+
+    async def api_pc_shutdown(req):
+        # POST + zaseban tajni kljuc. Bez ispravnog kljuca nema gasenja.
+        if os.name != 'nt':
+            return web.json_response({'ok': False, 'err': 'Podrzan je samo Windows'}, status=400)
+        # Browser mora dolaziti sa samog ICweb origin-a; blokira cross-site POST.
+        origin = req.headers.get('Origin', '')
+        expected = f'{req.scheme}://{req.host}'
+        if not origin or origin != expected:
+            return web.json_response({'ok': False, 'err': 'Neispravan Origin'}, status=403)
+        client = req.remote or 'unknown'
+        now = time.monotonic()
+        attempts = app['shutdown_attempts']
+        attempts[client] = [t for t in attempts.get(client, []) if now - t < 300]
+        if len(attempts[client]) >= 5:
+            return web.json_response({'ok': False, 'err': 'Previse pokusaja. Pricekaj 5 minuta.'}, status=429)
+        try:
+            payload = await req.json()
+            key = payload.get('key', '')
+        except Exception:
+            key = ''
+        if not isinstance(key, str) or not hmac.compare_digest(key, app['shutdown_key']):
+            attempts[client].append(now)
+            return web.json_response({'ok': False, 'err': 'Pogresan sigurnosni kljuc'}, status=403)
+        # 15 s odgode da browser primi potvrdu, bez prisilnog zatvaranja aplikacija.
+        try:
+            subprocess.Popen(['shutdown.exe', '/s', '/t', '15'],
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except Exception as exc:
+            return web.json_response({'ok': False, 'err': 'Windows nije prihvatio gasenje: '+str(exc)[:120]}, status=500)
+        print('[ICWEB] SHUTDOWN PC potvrden; Windows se gasi za 15 sekundi')
+        return web.json_response({'ok': True})
+
+    async def api_ping(_):
+        return web.json_response({'ok': True, 'radio_connected': bool(radio.ser)})
+
+    async def api_macros_get(_):
+        return web.json_response({'macros': app['macros'], 'names': app['macnames'],
+                                  'mycall': app['macro_identity']['mycall'], 'gridsquare': app['macro_identity']['grid']})
+
+    async def api_macros_post(req):
+        try:
+            d = await req.json()
+            if not isinstance(d, dict):
+                raise ValueError('Neispravan JSON zahtjev')
+            # /cw ne salje mycall/gridsquare: sacuvaj postojece vrijednosti.
+            macros = norm8(d.get('macros', app['macros']), count=15)
+            names = norm_names(d.get('names', app['macnames']), count=15)
+            mycall = str(d.get('mycall', app['macro_identity']['mycall']))[:12]
+            grid = str(d.get('gridsquare', app['macro_identity']['grid']))[:8]
+            saved = save_macros(macros, names, mycall, grid)
+            # Stanje u memoriji mijenjamo tek nakon uspjesnog zapisa na disk.
+            app['macros'][:] = saved['macros']
+            app['macnames'][:] = saved['names']
+            app['macro_identity']['mycall'] = saved['mycall']
+            app['macro_identity']['grid'] = saved['gridsquare']
+        except Exception as exc:
+            print('!! CW makroi - greska spremanja:', repr(exc))
+            return web.json_response({'ok': False, 'err': str(exc)}, status=400)
+        return web.json_response({'ok': True, 'count': len(app['macros'])})
+
+    async def ws_handler(req):
+        ws = web.WebSocketResponse(heartbeat=10)
+        await ws.prepare(req)
+        app['clients'].add(ws)
+        print('** WS klijent spojen:', req.remote)
+        try:
+            await ws.send_str(json.dumps(radio.state))
+            await ws.send_str(json.dumps(app['rot_state']))
+            async for m in ws:
+                try:
+                    if m.type == web.WSMsgType.TEXT:
+                        d = json.loads(m.data)
+                        k = d.get('k')
+                        if k in ('rot_go', 'rot_stop', 'rot_reset'):
+                            try:
+                                async with app['rot_lock']:
+                                    if k == 'rot_stop':
+                                        await asyncio.to_thread(app['rotor'].stop)
+                                        app['rot_runtime']['rot_target'] = None
+                                        app['rot_runtime']['rot_go_at'] = None
+                                    elif k == 'rot_reset':
+                                        state = app['rot_state']
+                                        if not state.get('rot_connected') or not isinstance(state.get('rot_raw'), int) or not -180 <= state['rot_raw'] <= 180:
+                                            raise ValueError('RESET odbijen: nema valjanog RAW ocitanja')
+                                        if time.monotonic() - app['rot_runtime']['rot_last_read'] > 3:
+                                            raise ValueError('RESET odbijen: ocitanje zastarjelo')
+                                        if app['rot_runtime']['rot_target'] is not None or state.get('rot_direction') not in ('---', None):
+                                            raise ValueError('RESET odbijen: rotor nije potvrden kao miran')
+                                        app['rot_runtime']['rot_fault'] = None
+                                        app['rot_runtime']['rot_stop_result'] = ''
+                                    else:
+                                        if app['rot_runtime']['rot_fault']:
+                                            raise ValueError('SAFETY LOCK: '+app['rot_runtime']['rot_fault']+'; prvo provjeri rotor pa RESET')
+                                        state = app['rot_state']
+                                        if not state.get('rot_connected') or state.get('rot_raw') is None:
+                                            raise ValueError('Nema valjanog ocitanja rotora')
+                                        # Ne dozvoli naredbu na temelju starog ocitanja.
+                                        if time.monotonic() - app['rot_runtime']['rot_last_read'] > 3:
+                                            raise ValueError('Ocitanje rotora je zastarjelo')
+                                        await asyncio.to_thread(app['rotor'].go, d.get('v'), state['rot_raw'])
+                                        app['rot_runtime']['rot_target'] = int(d['v'])
+                                        app['rot_runtime']['rot_go_at'] = time.monotonic()
+                                await ws.send_str(json.dumps({'rot_message': 'STOP poslan' if k=='rot_stop' else ('RESET prihvacen' if k=='rot_reset' else 'GO poslan')}))
+                            except Exception as exc:
+                                await ws.send_str(json.dumps({'rot_message': 'Greska: '+str(exc)}))
+                        elif k == 'ptt':
+                            want = bool(d.get('v'))
+                            if want and app['ptt_owner'] is None and radio.state.get('mode') in ('USB','LSB') and audio and audio.dev_out is not None:
+                                app['ptt_owner'] = ws
+                                app['ptt_since'] = time.monotonic()
+                                app['ptt_last_audio'] = time.monotonic()
+                                radio.apply('ptt', 1)
+                            elif not want and app['ptt_owner'] is ws:
+                                app['ptt_owner'] = None
+                                radio.apply('ptt', 0)
+                        elif k == 'cw_stop':
+                            app['ptt_owner'] = None
+                            radio.apply(k, d.get('v'))
+                            for client in list(app['clients']):
+                                if not client.closed:
+                                    await client.send_str(json.dumps({'cw_monitor_stop': True}))
+                        elif k == 'cw':
+                            cwtext = str(d.get('v') or '').replace('(call)', radio.callsign or '')
+                            radio.apply(k, d.get('v'))
+                            event = json.dumps({'cw_monitor': {'text': cwtext, 'wpm': radio.state.get('cwspd') or 20}})
+                            for client in list(app['clients']):
+                                if not client.closed:
+                                    await client.send_str(event)
+                        elif k and k not in ('ptt',):
+                            radio.apply(k, d.get('v'))
+                    elif m.type == web.WSMsgType.BINARY and audio and m.data[:1] == b'\x03' \
+                            and app['ptt_owner'] is ws and radio.state.get('ptt') \
+                            and radio.state.get('mode') in ('USB','LSB'):
+                        app['ptt_last_audio'] = time.monotonic()
+                        audio.play(m.data[1:])
+                except Exception as e:
+                    print('cmd err', repr(e))
+        except Exception:
+            import traceback
+            print('!! WS PUKAO - razlog:')
+            traceback.print_exc()
+        finally:
+            app['clients'].discard(ws)
+            print('** WS klijent odspojen')
+            if app['ptt_owner'] is ws:
+                app['ptt_owner'] = None
+                radio.apply('ptt', 0)
+        return ws
+
+    async def on_start(app):
+        loop = asyncio.get_running_loop()
+        async def tx_watchdog():
+            while True:
+                await asyncio.sleep(0.25)
+                owner = app['ptt_owner']
+                if owner is not None and (time.monotonic()-app['ptt_since']>180 or
+                                         time.monotonic()-app['ptt_last_audio']>3 or
+                                         radio.state.get('mode') not in ('USB','LSB') or
+                                         owner.closed):
+                    app['ptt_owner'] = None
+                    radio.apply('ptt', 0)
+        app['tx_watchdog_task'] = asyncio.create_task(tx_watchdog())
+
+        async def rotor_poll():
+            # Aktivna aplikacijska zastita; ne zamjenjuje hardverske granicnike.
+            # RAW -180..180 ima dva razlicita mehanicka kraja.
+            previous_raw = None
+            previous_time = None
+            stable_count = 0
+            jump_count = 0
+            last_event = None
+            while True:
+                async with app['rot_lock']:
+                    state = await asyncio.to_thread(app['rotor'].read)
+                    now = time.monotonic()
+                    state['rot_target'] = app['rot_runtime']['rot_target']
+                    warnings = []
+                    if state['rot_connected']:
+                        raw = state['rot_raw']
+                        az = state['rot_az']
+                        if not -180 <= raw <= 180:
+                            warnings.append('RAW IZVAN GRANICA')
+                        if previous_raw is None or previous_time is None or now - previous_time > 5:
+                            state['rot_direction'] = 'NEPOZNAT'
+                            state['rot_motion'] = 'POCETNO OCITANJE'
+                            stable_count = 0
+                        else:
+                            delta = raw - previous_raw
+                            dt = max(0.001, now - previous_time)
+                            # Ne pretpostavljamo brzinu motora: veliki skok samo biljezimo.
+                            if abs(delta) > 45:
+                                # AlfaSpid poslije GO moze kratko vratiti zadani kut
+                                # umjesto stvarnog. Jedno takvo ocitanje nije dokaz
+                                # fizickog pomaka; trazimo 3 uzastopna odstupanja.
+                                jump_count += 1
+                                if jump_count >= 3:
+                                    warnings.append('TRAJAN SKOK RAW >45° (3 OCITANJA)')
+                                else:
+                                    warnings.append('PRIJELAZNO RAW OCITANJE (%d/3) - PROVJERA' % jump_count)
+                            else:
+                                jump_count = 0
+                            if abs(delta) < 0.5:
+                                stable_count += 1
+                                state['rot_direction'] = '---'
+                                state['rot_motion'] = 'MIRUJE / NEMA PROMJENE'
+                            else:
+                                stable_count = 0
+                                state['rot_direction'] = 'RASTE' if delta > 0 else 'PADA'
+                                state['rot_motion'] = 'KRECE SE (PROCJENA)'
+                        # Ne koristimo nevaljana ocitanja za sljedecu usporedbu.
+                        if -180 <= raw <= 180 and (previous_raw is None or abs(raw - previous_raw) <= 45):
+                            previous_raw, previous_time = raw, now
+                            app['rot_runtime']['rot_last_good'] = now
+                        elif not -180 <= raw <= 180:
+                            previous_raw = previous_time = None
+                        # Kod skoka zadrzi posljednji vjerodostojan RAW za usporedbu.
+                        app['rot_runtime']['rot_last_read'] = now
+                        if app['rot_runtime']['rot_target'] is not None:
+                            target = app['rot_runtime']['rot_target']
+                            # Razlika cilja i prikazanog azimuta, uz kruznu normalizaciju.
+                            error = abs((az - target + 180) % 360 - 180)
+                            if error <= 1 and stable_count >= 2 and jump_count == 0:
+                                state['rot_motion'] = 'TARGET REACHED'
+                                app['rot_runtime']['rot_target'] = None
+                                state['rot_target'] = None
+                    else:
+                        if app['rot_runtime']['rot_target'] is not None:
+                            warnings.append('GUBITAK COM6 VEZE TIJEKOM GO')
+                        previous_raw = previous_time = None
+                        jump_count = 0
+                        stable_count = 0
+                        state['rot_direction'] = '---'
+                        state['rot_motion'] = 'NEMA VEZE'
+                    # STOP se salje samo za anomaliju dok je GO aktivan.
+                    # Gubitak veze moze onemoguciti STOP: to nije potvrda zaustavljanja.
+                    critical = [w for w in warnings if not w.startswith('PRIJELAZNO RAW OCITANJE')]
+                    if critical and app['rot_runtime']['rot_target'] is not None and not app['rot_runtime']['rot_fault']:
+                        app['rot_runtime']['rot_fault'] = ' / '.join(critical)
+                        app['rot_runtime']['rot_target'] = None
+                        app['rot_runtime']['rot_go_at'] = None
+                        state['rot_target'] = None
+                        try:
+                            await asyncio.to_thread(app['rotor'].stop)
+                            app['rot_runtime']['rot_stop_result'] = 'STOP POSLAN (nije potvrdeno mirovanje)'
+                        except Exception as exc:
+                            app['rot_runtime']['rot_stop_result'] = 'STOP NIJE POTVRDEN: '+str(exc)[:90]
+                        print('[ROTOR SAFETY]', app['rot_runtime']['rot_fault'], '|', app['rot_runtime']['rot_stop_result'])
+                    state['rot_warning'] = ' / '.join(warnings)
+                    state['rot_fault'] = app['rot_runtime']['rot_fault']
+                    state['rot_stop_result'] = app['rot_runtime']['rot_stop_result']
+                    state['rot_monitor_mode'] = 'SAFETY LOCK' if app['rot_runtime']['rot_fault'] else 'ACTIVE MONITOR'
+                    if warnings:
+                        event = (tuple(warnings), state.get('rot_raw'))
+                        if event != last_event:
+                            line = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + ' | ' + state['rot_warning'] + ' | RAW=' + str(state.get('rot_raw'))
+                            app['rot_runtime']['rot_monitor_events'].append(line)
+                            app['rot_runtime']['rot_monitor_events'] = app['rot_runtime']['rot_monitor_events'][-50:]
+                            print('[ROTOR MONITOR]', line)
+                        last_event = event
+                    else:
+                        last_event = None
+                    app['rot_state'].clear()
+                    app['rot_state'].update(state)
+                for client in list(app['clients']):
+                    if not client.closed:
+                        try: await client.send_str(json.dumps(state))
+                        except Exception: pass
+                await asyncio.sleep(1.0 if state['rot_connected'] else 3.0)
+        app['rotor_task'] = asyncio.create_task(rotor_poll())
+
+        async def bcast(d):
+            for c in list(app['clients']):
+                try:
+                    await c.send_str(json.dumps(d))
+                except Exception:
+                    pass
+        radio.on_change = lambda d: loop.call_soon_threadsafe(asyncio.ensure_future, bcast(d))
+        radio.on_cw_key = lambda down: loop.call_soon_threadsafe(asyncio.ensure_future, bcast({'cw_key': int(down)}))
+
+        async def bcast_bin(b):
+            for c in list(app['clients']):
+                try:
+                    await c.send_bytes(b)
+                except Exception:
+                    pass
+        post = lambda b: app['clients'] and loop.call_soon_threadsafe(asyncio.ensure_future, bcast_bin(b))
+        radio.on_scope = post
+        if audio:
+            audio.start(post)
+        threading.Thread(target=radio.reader, daemon=True).start()
+        if hasattr(radio, 'poll'):                            # poll nije bitan za rad
+            threading.Thread(target=radio.poll, daemon=True).start()
+
+    app.on_startup.append(on_start)
+    async def on_cleanup(app):
+        rot_task = app.get('rotor_task')
+        if rot_task:
+            rot_task.cancel()
+            try: await rot_task
+            except asyncio.CancelledError: pass
+        app['rotor'].close()
+        task = app.get('tx_watchdog_task')
+        if task:
+            task.cancel()
+            try: await task
+            except asyncio.CancelledError: pass
+        if app['ptt_owner'] is not None:
+            app['ptt_owner'] = None
+            radio.apply('ptt', 0)
+    app.on_cleanup.append(on_cleanup)
+    app.router.add_get('/', index)
+    app.router.add_get('/cw', cw_page)
+    app.router.add_get('/api/ping', api_ping)
+    app.router.add_post('/api/pc/shutdown', api_pc_shutdown)
+    app.router.add_get('/api/macros', api_macros_get)
+    app.router.add_post('/api/macros', api_macros_post)
+    app.router.add_get('/ws', ws_handler)
+    async def api_log(req):
+        try:
+            d = await req.json()
+        except Exception:
+            return web.json_response({'ok': False, 'err': 'los zahtjev'}, status=400)
+        call = str(d.get('call', '')).strip().upper()[:10]
+        rst = str(d.get('rst', '')).strip().upper()[:3] or '599'
+        rstr = str(d.get('rstr', '')).strip().upper()[:3] or '599'   # zadani primljeni raport
+        name = str(d.get('name', '')).strip()[:80]
+        qth = str(d.get('qth', '')).strip()[:120]
+        if not call:
+            return web.json_response({'ok': False, 'err': 'nema pozivnog znaka'}, status=400)
+        freq = int(radio.state.get('freq') or 0)
+        mode = str(radio.state.get('mode') or '')
+        if mode in ('USB', 'LSB'):
+            mode = 'SSB'  # ADIF MODE: USB/LSB se zapisuju kao SSB
+        count = adif_append(call, rst, rstr, freq, mode, app['macro_identity']['mycall'], app['macro_identity']['grid'], name, qth)
+        return web.json_response({'ok': True, 'count': count})
+
+    async def log_page(req):
+        return web.Response(text=LOG_PAGE, content_type='text/html')
+
+    async def log_entries(req):
+        try:
+            with ADIF_LOCK:
+                _, records = adif_load()
+            return web.json_response({'ok': True, 'records': [
+                {k: adif_field(rec, k) for k in EDIT_FIELDS} for rec in records]})
+        except Exception as e:
+            return web.json_response({'ok': False, 'err': str(e)}, status=500)
+
+    async def log_update(req):
+        try:
+            idx = int(req.match_info['index'])
+            d = await req.json()
+            changes = d.get('fields', {})
+            if not isinstance(changes, dict): raise ValueError('Neispravni podaci')
+            adif_update(idx, changes)
+            return web.json_response({'ok': True})
+        except (ValueError, TypeError) as e:
+            return web.json_response({'ok': False, 'err': str(e)}, status=400)
+        except Exception as e:
+            return web.json_response({'ok': False, 'err': str(e)}, status=500)
+
+    async def log_delete(req):
+        try:
+            idx = int(req.match_info['index'])
+            adif_delete(idx)
+            return web.json_response({'ok': True})
+        except (ValueError, TypeError) as e:
+            return web.json_response({'ok': False, 'err': str(e)}, status=400)
+        except Exception as e:
+            return web.json_response({'ok': False, 'err': str(e)}, status=500)
+
+    app.router.add_get('/log', log_page)
+    app.router.add_get('/api/log/entries', log_entries)
+    app.router.add_put('/api/log/entries/{index}', log_update)
+    app.router.add_delete('/api/log/entries/{index}', log_delete)
+    app.router.add_post('/api/log', api_log)
+    return app
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--port',  default=None, help='COM3 (Silicon Labs CP210x Enhanced COM)')
+    ap.add_argument('--baud', type=int, default=115200)
+    ap.add_argument('--addr', type=lambda x: int(x, 16), default=0x94, help='CI-V adresa (hex), IC-7300 = 94')
+    ap.add_argument('--host', default='0.0.0.0')
+    ap.add_argument('--web-port', type=int, default=8080)
+    ap.add_argument('--password', default='')
+    ap.add_argument('--audio-in', default=None, help='indeks ili ime USB Audio CODEC ulaza (RX, zvuk iz radija)')
+    ap.add_argument('--audio-out', default=None, help='indeks ili ime USB Audio CODEC izlaza (TX)')
+    ap.add_argument('--gain', type=float, default=3.0, help='RX pojacanje (1 = bez pojacanja, 3 = 3x glasnije)')
+    ap.add_argument('--keyline', default='RTS', choices=['RTS', 'DTR'],
+                    help='serijska linija za USB Keying (CW) - mora odgovarati meniju radija')
+    ap.add_argument('--list-audio', action='store_true', help='ispisi audio uredjaje')
+    ap.add_argument('--cert', help='cert.pem za HTTPS (potreban za mikrofon izvan localhosta)')
+    ap.add_argument('--key', help='key.pem')
+    a = ap.parse_args()
+    if a.list_audio:
+        if sd is None:
+            ap.error('pip install numpy sounddevice')
+        print(sd.query_devices()); raise SystemExit
+    if not a.port:
+        ap.error('--port je obavezan')
+    dev = lambda s: int(s) if s is not None and s.isdigit() else s
+    audio = Audio(dev(a.audio_in), dev(a.audio_out), gain=a.gain) if (a.audio_in or a.audio_out) and np else None
+    if (a.audio_in or a.audio_out) and not np:
+        print('UPOZORENJE: numpy/sounddevice nisu instalirani, audio je iskljucen')
+    ctx = None
+    if a.cert:
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(a.cert, a.key)
+    print('=' * 60)
+    print('  IC-7300 WEB REMOTE', VERSION)
+    print('  glavno sucelje:  http://localhost:%d/' % a.web_port)
+    print('  CW console:      http://localhost:%d/cw' % a.web_port)
+    print('=' * 60)
+    web.run_app(make_app(Radio(a.port, a.baud, a.addr, a.keyline), a.password, audio),
+                host=a.host, port=a.web_port, ssl_context=ctx)
